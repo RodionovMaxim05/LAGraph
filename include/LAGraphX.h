@@ -1024,6 +1024,22 @@ GrB_Info LAGraph_RPQMatrix_Seq (GrB_Matrix lhs, GrB_Matrix rhs, GrB_Matrix *res,
 LAGRAPHX_PUBLIC
 GrB_Info LAGraph_RPQMatrix_ExtractRandom (GrB_Matrix rhs, GrB_Matrix *srhs, uint64_t seed);
 
+// Helpers used by the RPQ cardinality estimators.
+LAGRAPHX_PUBLIC
+GrB_Info LAGraph_RPQMatrix_sample_seed (GrB_Matrix *seed,
+    const GrB_Index *sources, GrB_Index nsources, GrB_Index n);
+LAGRAPHX_PUBLIC
+GrB_Info LAGraph_RPQMatrix_sample_apply (GrB_Matrix *result,
+    GrB_Matrix seed, GrB_Matrix relation, bool transpose_relation);
+LAGRAPHX_PUBLIC
+GrB_Info LAGraph_RPQMatrix_sample_union (GrB_Matrix *result,
+    GrB_Matrix lhs, GrB_Matrix rhs);
+LAGRAPHX_PUBLIC
+GrB_Info LAGraph_RPQMatrix_sample_dup (GrB_Matrix *result, GrB_Matrix source);
+LAGRAPHX_PUBLIC
+GrB_Info LAGraph_RPQMatrix_sample_stats (GrB_Index *nvals,
+    GrB_Index *active_rows, GrB_Index *active_cols, GrB_Matrix sample);
+
 LAGRAPHX_PUBLIC
 GrB_Info LAGraph_RPQMatrix_reduce(
     GrB_Index *res,
@@ -1032,6 +1048,25 @@ GrB_Info LAGraph_RPQMatrix_reduce(
                         // 0 --- reduce by row
                         // 1 --- reduce by col
 ) ;
+
+LAGRAPHX_PUBLIC
+GrB_Info LAGraph_RPQMatrix_reduce_count_vector (GrB_Vector *res,
+    GrB_Matrix mat, uint8_t reduce_type);
+LAGRAPHX_PUBLIC
+GrB_Info LAGraph_RPQMatrix_count_vector_dot (double *res,
+    GrB_Vector lhs, GrB_Vector rhs);
+LAGRAPHX_PUBLIC
+GrB_Info LAGraph_RPQMatrix_count_vector_sum (double *res, GrB_Vector vector);
+LAGRAPHX_PUBLIC
+GrB_Info LAGraph_RPQMatrix_count_vector_nvals (GrB_Index *res, GrB_Vector vector);
+LAGRAPHX_PUBLIC
+GrB_Info LAGraph_RPQMatrix_count_vector_scale (GrB_Vector *res,
+    GrB_Vector vector, double scale, double cap);
+LAGRAPHX_PUBLIC
+GrB_Info LAGraph_RPQMatrix_count_vector_add (GrB_Vector *res,
+    GrB_Vector lhs, GrB_Vector rhs, double cap);
+LAGRAPHX_PUBLIC
+GrB_Info LAGraph_RPQMatrix_count_vector_free (GrB_Vector *vector);
 
 
 //****************************************************************************
