@@ -27,13 +27,24 @@
 #include "LG_internal.h"
 #include <LAGraphX.h>
 
+static inline bool mid_entry_uses_heap(const MidEntry *e) {
+    return e->rule_count > MID_ENTRY_INLINE_CAP + 1;
+}
+
+static inline int32_t mid_entry_rest_id(const MidEntry *e, uint32_t k) {
+    if (mid_entry_uses_heap(e)) {
+        return e->rest.rule_ids_rest[k];
+    }
+    return e->rest.inline_ids[k];
+}
+
 static void free_mid_entry_contents(MidEntry *entry) {
-  if (entry == NULL)
-    return;
-  if (entry->rule_ids_rest != NULL) {
-    free(entry->rule_ids_rest);
-    entry->rule_ids_rest = NULL;
-  }
+    if (entry == NULL)
+        return;
+    if (mid_entry_uses_heap(entry) && entry->rest.rule_ids_rest != NULL) {
+        free(entry->rest.rule_ids_rest);
+    }
+    entry->rest.rule_ids_rest = NULL;
 }
 
 static inline size_t get_middle_cap(const MidEntry *middle) {
@@ -94,15 +105,38 @@ static void mid_entry_add_rule(MidEntry *e, int32_t rule_id) {
     if (e->rule_id0 == rule_id)
         return;
 
-    for (uint32_t k = 0; k + 1 < e->rule_count; k++) {
-        if (e->rule_ids_rest[k] == rule_id)
+    uint32_t extra = e->rule_count - 1;
+
+    if (!mid_entry_uses_heap(e)) {
+        for (uint32_t k = 0; k < extra; k++) {
+            if (e->rest.inline_ids[k] == rule_id) {
+                return;
+            }
+        }
+
+        if (extra < MID_ENTRY_INLINE_CAP) {
+            e->rest.inline_ids[extra] = rule_id;
+            e->rule_count++;
             return;
+        }
+
+        int32_t *heap = malloc((extra + 1) * sizeof(int32_t));
+        memcpy(heap, e->rest.inline_ids, extra * sizeof(int32_t));
+        heap[extra] = rule_id;
+        e->rest.rule_ids_rest = heap;
+        e->rule_count++;
+        return;
     }
 
-    uint32_t extra = e->rule_count - 1;
-    int32_t *tmp = realloc(e->rule_ids_rest, (extra + 1) * sizeof(int32_t));
+    for (uint32_t k = 0; k < extra; k++) {
+        if (e->rest.rule_ids_rest[k] == rule_id) {
+            return;
+        }
+    }
+
+    int32_t *tmp = realloc(e->rest.rule_ids_rest, (extra + 1) * sizeof(int32_t));
     tmp[extra] = rule_id;
-    e->rule_ids_rest = tmp;
+    e->rest.rule_ids_rest = tmp;
     e->rule_count++;
 }
 
@@ -112,7 +146,7 @@ static void mid_entry_merge_rules(MidEntry *dst, const MidEntry *src) {
 
     mid_entry_add_rule(dst, src->rule_id0);
     for (uint32_t k = 0; k + 1 < src->rule_count; k++) {
-        mid_entry_add_rule(dst, src->rule_ids_rest[k]);
+        mid_entry_add_rule(dst, mid_entry_rest_id(src, k));
     }
 }
 
@@ -244,7 +278,7 @@ static void mult_all_paths_post(AllPathsElem *z, const void *x, GrB_Index ix,
     z->data.single_elem.mid = jx;
     z->data.single_elem.rule_count = 1;
     z->data.single_elem.rule_id0 = rule_id;
-    z->data.single_elem.rule_ids_rest = NULL;
+    z->data.single_elem.rest.rule_ids_rest = NULL;
     z->n = 1;
 }
 
@@ -254,7 +288,7 @@ static void set_all_paths(AllPathsElem *z, const AllPathsElem *x,
                                              // terminal rule (A->t) or an epsilon rule (A->eps)
     z->data.single_elem.rule_count = 0;
     z->data.single_elem.rule_id0 = -1;
-    z->data.single_elem.rule_ids_rest = NULL;
+    z->data.single_elem.rest.rule_ids_rest = NULL;
     z->n = 1;
 }
 
@@ -326,11 +360,11 @@ GrB_Info LAGraph_CFL_AllPaths_adv(GrB_Matrix *outputs, GrB_Type *all_paths_ptr_t
     GrB_free(all_paths_ptr_t);
     GRB_TRY(
         GxB_Type_new(all_paths_ptr_t, sizeof(AllPathsElem), "AllPathsElem",
-                    "typedef struct{GrB_Index mid;uint32_t rule_count;int32_t rule_id0;"
-                    "int32_t* rule_ids_rest;}MidEntry;"
-                    "typedef struct{size_t n;union{MidEntry single_elem;"
-                    "MidEntry* middle;}data;}"
-                    "AllPathsElem;"));
+                     "typedef struct{GrB_Index mid;uint32_t rule_count;int32_t rule_id0;"
+                     "union{int32_t inline_ids[2];int32_t* rule_ids_rest;}rest;}MidEntry;"
+                     "typedef struct{size_t n;union{MidEntry single_elem;"
+                     "MidEntry* middle;}data;}"
+                     "AllPathsElem;"));
     AllPaths_type = *all_paths_ptr_t;
 
     AllPathsElem bottom = {0};

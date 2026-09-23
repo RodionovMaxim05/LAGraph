@@ -1100,12 +1100,17 @@ GrB_Info LAGraph_CFPQ_core
     char *msg // Message string for error reporting.
 );
 
+#define MID_ENTRY_INLINE_CAP 2
+
 typedef struct
 {
     GrB_Index mid;
     uint32_t rule_count;
     int32_t rule_id0;
-    int32_t *rule_ids_rest;
+    union {
+        int32_t inline_ids[MID_ENTRY_INLINE_CAP];
+        int32_t *rule_ids_rest;
+    } rest;
 } MidEntry;
 
 typedef struct
