@@ -15,159 +15,246 @@
         LAGraph_Free((void **)&term_rules, NULL);                                        \
         LAGraph_Free((void **)&bin_rules, NULL);                                         \
         LAGraph_Free((void **)&new_rules, NULL);                                         \
-        GrB_free(&AllPaths_semiring);                                                    \
         GrB_free(&AllPaths_monoid);                                                      \
         GrB_free(&bottom_scalar);                                                        \
         GrB_free(&IAllPaths_mult);                                                       \
         GrB_free(&AllPaths_set);                                                         \
-        GrB_free(&AllPaths_mult);                                                        \
         GrB_free(&AllPaths_add);                                                         \
-        GrB_free(&Theta);                                                                \
+        GrB_free(&rule_theta);                                                           \
+        LAGraph_Free((void **)&rule_table, NULL);                                        \
     }
 
 #include "LG_internal.h"
 #include <LAGraphX.h>
 
-// Merging two ordered arrays of internal vertices in the add function
-static GrB_Index *merge_all_paths(size_t *n, const GrB_Index *a, const size_t na,
-                                  const GrB_Index *b, const size_t nb) {
-    GrB_Index *tmp = malloc((na + nb) * sizeof(GrB_Index));
-
-    size_t ia = 0, ib = 0, outn = 0;
-    // Handle the first elements of both arrays to initialize tmp and avoid checking if
-    // tmp is empty in the loop
-    if (na > 0 && nb > 0) {
-        if (a[0] < b[0]) {
-            tmp[outn++] = a[ia++];
-        } else if (b[0] < a[0]) {
-            tmp[outn++] = b[ib++];
-        } else {
-            tmp[outn++] = a[ia++];
-            ib++;
-        }
-    } else if (na > 0) {
-        tmp[outn++] = a[ia++];
-    } else {
-        tmp[outn++] = b[ib++];
-    }
-
-    while (ia < na && ib < nb) {
-        GrB_Index va = a[ia];
-        GrB_Index vb = b[ib];
-        if (va < vb) {
-            if (tmp[outn - 1] != va)
-                tmp[outn++] = va;
-            ia++;
-        } else if (vb < va) {
-            if (tmp[outn - 1] != vb)
-                tmp[outn++] = vb;
-            ib++;
-        } else {
-            if (tmp[outn - 1] != va)
-                tmp[outn++] = va;
-            ia++;
-            ib++;
-        }
-    }
-    while (ia < na) {
-        GrB_Index va = a[ia++];
-        if (tmp[outn - 1] != va)
-            tmp[outn++] = va;
-    }
-    while (ib < nb) {
-        GrB_Index vb = b[ib++];
-        if (tmp[outn - 1] != vb)
-            tmp[outn++] = vb;
-    }
-
-    tmp = realloc(tmp, outn * sizeof(GrB_Index));
-    *n = outn;
-
-    return tmp;
+static void free_mid_entry_contents(MidEntry *entry) {
+  if (entry == NULL)
+    return;
+  if (entry->rule_ids_rest != NULL) {
+    free(entry->rule_ids_rest);
+    entry->rule_ids_rest = NULL;
+  }
 }
 
-static GrB_Index *insert_all_paths(size_t *n, const GrB_Index *arr, size_t len,
-                                   GrB_Index value) {
-    // Array is ordered, so we can use binary search to find the position to insert value
-    size_t l = 0, r = len, m = 0;
+static inline size_t get_middle_cap(const MidEntry *middle) {
+    if (middle == NULL)
+        return 0;
+    return ((const size_t *)middle)[-1];
+}
+
+static inline MidEntry *alloc_middle(size_t cap) {
+    size_t *raw = malloc(sizeof(size_t) + cap * sizeof(MidEntry));
+    if (!raw)
+        return NULL;
+    raw[0] = cap;
+    return (MidEntry *)(raw + 1);
+}
+
+static inline MidEntry *realloc_middle(MidEntry *middle, size_t new_cap) {
+    if (middle == NULL)
+        return alloc_middle(new_cap);
+    size_t *raw = (size_t *)middle - 1;
+    size_t *new_raw = realloc(raw, sizeof(size_t) + new_cap * sizeof(MidEntry));
+    if (!new_raw)
+        return NULL;
+    new_raw[0] = new_cap;
+    return (MidEntry *)(new_raw + 1);
+}
+
+static inline void free_middle(MidEntry *middle) {
+    if (middle == NULL)
+        return;
+    size_t *raw = (size_t *)middle - 1;
+    free(raw);
+}
+
+static void free_all_paths_elem_internal(AllPathsElem *elem) {
+    if (elem == NULL || elem->n == 0)
+        return;
+
+    if (elem->n == 1) {
+        free_mid_entry_contents(&elem->data.single_elem);
+    } else if (elem->data.middle != NULL) {
+        for (size_t i = 0; i < elem->n; i++) {
+            free_mid_entry_contents(&elem->data.middle[i]);
+        }
+        free_middle(elem->data.middle);
+        elem->data.middle = NULL;
+    }
+    elem->n = 0;
+}
+
+static void mid_entry_add_rule(MidEntry *e, int32_t rule_id) {
+    if (e->rule_count == 0) {
+        e->rule_id0 = rule_id;
+        e->rule_count = 1;
+        return;
+    }
+
+    if (e->rule_id0 == rule_id)
+        return;
+
+    for (uint32_t k = 0; k + 1 < e->rule_count; k++) {
+        if (e->rule_ids_rest[k] == rule_id)
+            return;
+    }
+
+    uint32_t extra = e->rule_count - 1;
+    int32_t *tmp = realloc(e->rule_ids_rest, (extra + 1) * sizeof(int32_t));
+    tmp[extra] = rule_id;
+    e->rule_ids_rest = tmp;
+    e->rule_count++;
+}
+
+static void mid_entry_merge_rules(MidEntry *dst, const MidEntry *src) {
+    if (src->rule_count == 0)
+        return;
+
+    mid_entry_add_rule(dst, src->rule_id0);
+    for (uint32_t k = 0; k + 1 < src->rule_count; k++) {
+        mid_entry_add_rule(dst, src->rule_ids_rest[k]);
+    }
+}
+
+static inline size_t all_paths_next_cap(size_t cur_cap, size_t need) {
+    size_t cap = (cur_cap == 0) ? 4 : cur_cap;
+    while (cap < need) {
+        cap *= 2;
+    }
+    return cap;
+}
+
+static void insert_all_paths(AllPathsElem *elem, MidEntry *value) {
+    MidEntry *arr = elem->data.middle;
+    size_t len = elem->n;
+
+    size_t l = 0, r = len;
     while (l < r) {
-        m = l + (r - l) / 2;
-        if (arr[m] < value)
+        size_t m = l + (r - l) / 2;
+        if (arr[m].mid < value->mid)
             l = m + 1;
         else
             r = m;
     }
 
-    // If value is already in the array, return the original array
-    if (l < len && arr[l] == value) {
-        GrB_Index *tmp = malloc(len * sizeof(GrB_Index));
-        memcpy(tmp, arr, len * sizeof(GrB_Index));
-        *n = len;
-        return tmp;
+    if (l < len && arr[l].mid == value->mid) {
+        mid_entry_merge_rules(&arr[l], value);
+        free_mid_entry_contents(value);
+        return;
     }
 
-    GrB_Index *tmp = malloc((len + 1) * sizeof(GrB_Index));
-    memcpy(tmp, arr, l * sizeof(GrB_Index));
-    tmp[l] = value;
-    memcpy(tmp + l + 1, arr + l, (len - l) * sizeof(GrB_Index));
+    size_t cur_cap = get_middle_cap(arr);
+    if (len == cur_cap) {
+        size_t new_cap = all_paths_next_cap(cur_cap, len + 1);
+        arr = realloc_middle(arr, new_cap);
+        elem->data.middle = arr;
+    }
 
-    *n = len + 1;
+    if (l < len) {
+        memmove(&arr[l + 1], &arr[l], (len - l) * sizeof(MidEntry));
+    }
+    arr[l] = *value;
+    elem->n = len + 1;
+}
+
+static MidEntry *merge_all_paths(size_t *out_n, MidEntry *a, size_t na, MidEntry *b,
+                                      size_t nb) {
+    size_t alloc_cap = na + nb;
+    MidEntry *tmp = alloc_middle(alloc_cap);
+    size_t ia = 0, ib = 0, outn = 0;
+
+    while (ia < na && ib < nb) {
+        if (a[ia].mid < b[ib].mid) {
+            tmp[outn++] = a[ia++];
+        } else if (b[ib].mid < a[ia].mid) {
+            tmp[outn++] = b[ib++];
+        } else {
+            mid_entry_merge_rules(&a[ia], &b[ib]);
+            free_mid_entry_contents(&b[ib]);
+            tmp[outn++] = a[ia];
+            ia++;
+            ib++;
+        }
+    }
+    while (ia < na) {
+        tmp[outn++] = a[ia++];
+    }
+    while (ib < nb) {
+        tmp[outn++] = b[ib++];
+    }
+
+    *out_n = outn;
+
     return tmp;
 }
 
 static void add_all_paths(AllPathsElem *z, AllPathsElem *x, AllPathsElem *y) {
-    // temp is needed to avoid freeing the memory of z in case z == x or z == y
-    AllPathsElem temp;
+    if (x->n == 0) {
+        *z = *y;
+        return;
+    }
+    if (y->n == 0) {
+        *z = *x;
+        return;
+    }
 
-    // x->n and y->n are not equal to zero
     if (x->n == 1 && y->n == 1) {
-        if (x->data.single_elem == y->data.single_elem) {
-            temp.n = 1;
-            temp.data.single_elem = x->data.single_elem;
+        MidEntry xs = x->data.single_elem;
+        MidEntry ys = y->data.single_elem;
+        if (xs.mid == ys.mid) {
+            mid_entry_merge_rules(&xs, &ys);
+            free_mid_entry_contents(&ys);
+            z->n = 1;
+            z->data.single_elem = xs;
         } else {
-            temp.n = 2;
-            temp.data.middle = malloc(2 * sizeof(GrB_Index));
-            if (x->data.single_elem < y->data.single_elem) {
-                temp.data.middle[0] = x->data.single_elem;
-                temp.data.middle[1] = y->data.single_elem;
-            } else {
-                temp.data.middle[0] = y->data.single_elem;
-                temp.data.middle[1] = x->data.single_elem;
-            }
+            MidEntry lo = (xs.mid < ys.mid) ? xs : ys;
+            MidEntry hi = (xs.mid < ys.mid) ? ys : xs;
+            size_t cap = 4;
+            MidEntry *arr = alloc_middle(cap);
+            arr[0] = lo;
+            arr[1] = hi;
+            z->n = 2;
+            z->data.middle = arr;
         }
-    } else if (x->n == 1) {
-        temp.data.middle =
-            insert_all_paths(&temp.n, y->data.middle, y->n, x->data.single_elem);
-    } else if (y->n == 1) {
-        temp.data.middle =
-            insert_all_paths(&temp.n, x->data.middle, x->n, y->data.single_elem);
-    } else {
-        temp.data.middle =
-            merge_all_paths(&temp.n, x->data.middle, x->n, y->data.middle, y->n);
+        return;
     }
 
-    if (x->n > 1) {
-        free(x->data.middle);
-    }
-    if (y->n > 1) {
-        free(y->data.middle);
+    if (x->n == 1 || y->n == 1) {
+        AllPathsElem *big = (x->n == 1) ? y : x;
+        MidEntry val = (x->n == 1) ? x->data.single_elem : y->data.single_elem;
+        insert_all_paths(big, &val);
+        *z = *big;
+        return;
     }
 
-    *z = temp;
+    MidEntry *a = x->data.middle, *b = y->data.middle;
+    size_t na = x->n, nb = y->n;
+    size_t zn;
+    MidEntry *merged = merge_all_paths(&zn, a, na, b, nb);
+    free_middle(a);
+    free_middle(b);
+    z->n = zn;
+    z->data.middle = merged;
 }
 
 static void mult_all_paths_post(AllPathsElem *z, const void *x, GrB_Index ix,
                                 GrB_Index jx, const void *y, GrB_Index iy, GrB_Index jy,
                                 const void *theta) {
-    z->data.single_elem = jx;
+    int32_t rule_id = *(const int32_t *)theta;
+    z->data.single_elem.mid = jx;
+    z->data.single_elem.rule_count = 1;
+    z->data.single_elem.rule_id0 = rule_id;
+    z->data.single_elem.rule_ids_rest = NULL;
     z->n = 1;
 }
 
 static void set_all_paths(AllPathsElem *z, const AllPathsElem *x,
                           const bool *edge_exist) {
-    z->data.single_elem =
-        GrB_INDEX_MAX; // A special value to indicate that this path corresponds to a
-                       // terminal rule (A->t) or an epsilon rule (A->eps)
+    z->data.single_elem.mid = GrB_INDEX_MAX; // A special value to indicate that this path corresponds to a
+                                             // terminal rule (A->t) or an epsilon rule (A->eps)
+    z->data.single_elem.rule_count = 0;
+    z->data.single_elem.rule_id0 = -1;
+    z->data.single_elem.rule_ids_rest = NULL;
     z->n = 1;
 }
 
@@ -177,16 +264,40 @@ static void set_all_paths(AllPathsElem *z, const AllPathsElem *x,
     "                     const void *y, GrB_Index iy, GrB_Index jy, \n"                 \
     "                     const void *theta) \n"                                         \
     "{ \n"                                                                               \
-    "  z->data.single_elem = jx; \n"                                                     \
+    "  int32_t rule_id = *(const int32_t *)theta; \n"                                    \
+    "  z->data.single_elem.mid = jx; \n"                                                 \
+    "  z->data.single_elem.rule_count = 1; \n"                                           \
+    "  z->data.single_elem.rule_id0 = rule_id; \n"                                       \
+    "  z->data.single_elem.rest.rule_ids_rest = NULL; \n"                                \
     "  z->n = 1; \n"                                                                     \
     "}"
 
+static inline GrB_Info rule_table_push(BinaryRuleInfo **table, size_t *count, size_t *cap,
+                                       int32_t nonterm, int32_t B, int32_t C) {
+    if (*count == *cap) {
+        size_t new_cap = (*cap == 0) ? 64 : (*cap * 2);
+        BinaryRuleInfo *tmp = realloc(*table, new_cap * sizeof(BinaryRuleInfo));
+        if (!tmp)
+            return GrB_OUT_OF_MEMORY;
+        *table = tmp;
+        *cap = new_cap;
+    }
+    (*table)[*count] = (BinaryRuleInfo){.nonterm = nonterm, .B = B, .C = C};
+    (*count)++;
+    return GrB_SUCCESS;
+}
+
 GrB_Info LAGraph_CFL_AllPaths_adv(GrB_Matrix *outputs, GrB_Type *all_paths_ptr_t,
+                                  BinaryRuleInfo **out_rule_table,
                                   const GrB_Matrix *adj_matrices, size_t symbols_amount,
                                   const LAGraph_rule_EWCNF *rules, size_t rules_count,
                                   char *msg, int8_t optimizations) {
     LG_CLEAR_MSG;
     size_t msg_len = 0;
+
+    BinaryRuleInfo *rule_table = NULL;
+    size_t rule_table_count = 0;
+    size_t rule_table_cap = 0;
 
     GrB_Type AllPaths_type = NULL;
 
@@ -208,20 +319,19 @@ GrB_Info LAGraph_CFL_AllPaths_adv(GrB_Matrix *outputs, GrB_Type *all_paths_ptr_t
     GrB_BinaryOp AllPaths_add = NULL;
     GrB_Monoid AllPaths_monoid = NULL;
     GxB_IndexBinaryOp IAllPaths_mult = NULL;
-    GrB_BinaryOp AllPaths_mult = NULL;
-    GrB_Semiring AllPaths_semiring = NULL;
     GrB_BinaryOp AllPaths_set = NULL;
-    GrB_Scalar Theta = NULL;
     GrB_Scalar bottom_scalar = NULL;
+    GrB_Scalar rule_theta = NULL;
 
     GrB_free(all_paths_ptr_t);
-    GRB_TRY(GxB_Type_new(all_paths_ptr_t, sizeof(AllPathsElem), "AllPathsElem",
-                         "typedef struct{size_t n;union{GrB_Index single_elem;GrB_Index* "
-                         "middle;}data;}AllPathsElem;"));
+    GRB_TRY(
+        GxB_Type_new(all_paths_ptr_t, sizeof(AllPathsElem), "AllPathsElem",
+                    "typedef struct{GrB_Index mid;uint32_t rule_count;int32_t rule_id0;"
+                    "int32_t* rule_ids_rest;}MidEntry;"
+                    "typedef struct{size_t n;union{MidEntry single_elem;"
+                    "MidEntry* middle;}data;}"
+                    "AllPathsElem;"));
     AllPaths_type = *all_paths_ptr_t;
-
-    GRB_TRY(GrB_Scalar_new(&Theta, GrB_BOOL));
-    GRB_TRY(GrB_Scalar_setElement_BOOL(Theta, false));
 
     AllPathsElem bottom = {0};
     GRB_TRY(GrB_Scalar_new(&bottom_scalar, AllPaths_type));
@@ -232,11 +342,9 @@ GrB_Info LAGraph_CFL_AllPaths_adv(GrB_Matrix *outputs, GrB_Type *all_paths_ptr_t
     GRB_TRY(GrB_Monoid_new(&AllPaths_monoid, AllPaths_add, (void *)(&bottom)));
 
     GRB_TRY(GxB_IndexBinaryOp_new(&IAllPaths_mult, (void *)mult_all_paths_post,
-                                  AllPaths_type, GrB_BOOL, GrB_BOOL, GrB_BOOL,
+                                  AllPaths_type, GrB_BOOL, GrB_BOOL, GrB_INT32,
                                   "mult_all_paths_post", MULT_PATH_POST_INDEX_DEFN));
 
-    GRB_TRY(GxB_BinaryOp_new_IndexOp(&AllPaths_mult, IAllPaths_mult, Theta));
-    GRB_TRY(GrB_Semiring_new(&AllPaths_semiring, AllPaths_monoid, AllPaths_mult));
     GRB_TRY(GrB_BinaryOp_new(&AllPaths_set, (void *)set_all_paths, AllPaths_type,
                              AllPaths_type, GrB_BOOL));
 
@@ -289,17 +397,12 @@ GrB_Info LAGraph_CFL_AllPaths_adv(GrB_Matrix *outputs, GrB_Type *all_paths_ptr_t
     GRB_TRY(GrB_Scalar_setElement_BOOL(false_scalar, false));
     LG_TRY(LAGraph_Calloc((void **)&t_empty_flags, symbols_amount, sizeof(bool), msg));
 
-    GrB_Index n;
-    bool found_n = false;
+    GrB_Index n = 0;
     for (size_t i = 0; i < symbols_amount; i++) {
         if (adj_matrices[i] != NULL) {
             GRB_TRY(GrB_Matrix_ncols(&n, adj_matrices[i]));
-            found_n = true;
             break;
         }
-    }
-    if (!found_n) {
-        n = 0;
     }
 
     for (size_t i = 0; i < symbols_amount; i++) {
@@ -320,15 +423,10 @@ GrB_Info LAGraph_CFL_AllPaths_adv(GrB_Matrix *outputs, GrB_Type *all_paths_ptr_t
 
         if (is_rule_eps) {
             eps_rules[eps_rules_count++] = i;
-            continue;
-        }
-        if (is_rule_term) {
+        } else if (is_rule_term) {
             term_rules[term_rules_count++] = i;
-            continue;
-        }
-        if (is_rule_bin) {
+        } else if (is_rule_bin) {
             bin_rules[bin_rules_count++] = i;
-            continue;
         }
     }
 
@@ -369,11 +467,13 @@ GrB_Info LAGraph_CFL_AllPaths_adv(GrB_Matrix *outputs, GrB_Type *all_paths_ptr_t
 
     for (size_t i = 0; i < symbols_amount; i++) {
         GrB_Index temp_nvals = 0;
-        GrB_Matrix_nvals(&temp_nvals, outputs_reachability[i]);
+        GRB_TRY(GrB_Matrix_nvals(&temp_nvals, outputs_reachability[i]));
         if (temp_nvals != 0) {
             t_empty_flags[i] = false;
         }
     }
+
+    GRB_TRY(GrB_Scalar_new(&rule_theta, GrB_INT32));
 
     for (size_t i = 0; i < bin_rules_count; i++) {
         LAGraph_rule_EWCNF bin_rule = new_rules[bin_rules[i]];
@@ -381,10 +481,32 @@ GrB_Info LAGraph_CFL_AllPaths_adv(GrB_Matrix *outputs, GrB_Type *all_paths_ptr_t
         if (t_empty_flags[bin_rule.prod_A] || t_empty_flags[bin_rule.prod_B])
             continue;
 
+        int32_t this_rule_id = (int32_t)rule_table_count;
+        LG_TRY(rule_table_push(&rule_table, &rule_table_count, &rule_table_cap,
+                        bin_rule.nonterm, bin_rule.prod_A, bin_rule.prod_B));
+
+        GRB_TRY(GrB_Scalar_setElement_INT32(rule_theta, this_rule_id));
+
+        GrB_BinaryOp rule_mult;
+        GRB_TRY(GxB_BinaryOp_new_IndexOp(&rule_mult, IAllPaths_mult, rule_theta));
+
+        GrB_Semiring rule_semiring;
+        GRB_TRY(GrB_Semiring_new(&rule_semiring, AllPaths_monoid, rule_mult));
+
         GrB_BinaryOp acc_op = t_empty_flags[bin_rule.nonterm] ? GrB_NULL : AllPaths_add;
-        GRB_TRY(GrB_mxm(T[bin_rule.nonterm], GrB_NULL, acc_op, AllPaths_semiring,
+        GRB_TRY(GrB_mxm(T[bin_rule.nonterm], GrB_NULL, acc_op, rule_semiring,
                         outputs_reachability[bin_rule.prod_A],
                         outputs_reachability[bin_rule.prod_B], GrB_NULL));
+
+        GrB_free(&rule_semiring);
+        GrB_free(&rule_mult);
+
+        t_empty_flags[bin_rule.nonterm] = false;
+    }
+
+    if (out_rule_table) {
+        *out_rule_table = rule_table;
+        rule_table = NULL;
     }
 
     for (size_t i = 0; i < symbols_amount; i++) {
@@ -409,9 +531,7 @@ static void free_AllPaths_matrix(GrB_Matrix *ptr_output) {
 
     while (info != GxB_EXHAUSTED) {
         GxB_Iterator_get_UDT(iterator, (void *)&val);
-        if (val.n > 1 && val.data.middle != NULL) {
-            free(val.data.middle);
-        }
+        free_all_paths_elem_internal(&val);
         info = GxB_Matrix_Iterator_next(iterator);
     }
 

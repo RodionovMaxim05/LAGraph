@@ -1727,10 +1727,11 @@ GrB_Info LAGraph_CFL_reachability_adv
 ) ;
 
 GrB_Info LAGraph_CFL_AllPaths_adv(
-    GrB_Matrix *outputs, 
+    GrB_Matrix *outputs,
     GrB_Type *all_paths_ptr_t,
-    const GrB_Matrix *adj_matrices, 
-    size_t symbols_amount,       
+    BinaryRuleInfo **out_rule_table,
+    const GrB_Matrix *adj_matrices,
+    size_t symbols_amount,
     const LAGraph_rule_EWCNF *rules,
     size_t rules_count,
     char *msg,
