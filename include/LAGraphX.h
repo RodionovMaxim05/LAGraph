@@ -1102,13 +1102,28 @@ GrB_Info LAGraph_CFPQ_core
 
 typedef struct
 {
+    GrB_Index mid;
+    uint32_t rule_count;
+    int32_t rule_id0;
+    int32_t *rule_ids_rest;
+} MidEntry;
+
+typedef struct
+{
     size_t n;
     union
     {
-        GrB_Index single_elem;
-        GrB_Index* middle;
+        MidEntry single_elem;
+        MidEntry *middle;
     } data;
 } AllPathsElem;
+
+typedef struct
+{
+    int32_t nonterm;
+    int32_t B;
+    int32_t C;
+} BinaryRuleInfo;
 
 // all_paths_ptr_t is a pointer to the type of elements of the outputs matrices.
 // Use GrB_free(all_paths_ptr_t) after you finish working with the outputs matrices.
