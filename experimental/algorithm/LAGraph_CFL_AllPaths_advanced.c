@@ -153,7 +153,7 @@ static void mid_entry_merge_rules(MidEntry *dst, const MidEntry *src) {
 static inline size_t all_paths_next_cap(size_t cur_cap, size_t need) {
     size_t cap = (cur_cap == 0) ? 4 : cur_cap;
     while (cap < need) {
-        cap *= 2;
+        cap += cap / 2 + 1;
     }
     return cap;
 }
