@@ -8,9 +8,9 @@
 #include <stdio.h>
 
 #define run_algorithm()                                                                  \
-    LAGraph_CFL_AllPaths(outputs, &all_paths_t, adj_matrices, grammar.terms_count,       \
-                         grammar.nonterms_count, grammar.rules, grammar.rules_count,     \
-                         msg, mode)
+    LAGraph_CFL_AllPaths(outputs, &all_paths_t, &rule_table, adj_matrices,               \
+                         grammar.terms_count, grammar.nonterms_count, grammar.rules,     \
+                         grammar.rules_count, msg, mode)
 
 #define check_error(error)                                                               \
     {                                                                                    \
@@ -36,6 +36,7 @@ typedef struct {
 
 int8_t mode = 0;
 GrB_Type all_paths_t = NULL;
+BinaryRuleInfo *rule_table = NULL;
 GrB_Matrix *adj_matrices = NULL;
 int n_adj_matrices = 0;
 GrB_Matrix *outputs = NULL;
@@ -105,28 +106,28 @@ char *output_to_str(size_t nonterm) {
         len += (size_t)wrote;
 
         if (val[i].n == 1) {
-            if (val[i].data.single_elem == GrB_INDEX_MAX) {
+            if (val[i].data.single_elem.mid == GrB_INDEX_MAX) {
                 wrote = sprintf(result_str + len, "INDEX_MAX");
             } else {
                 wrote = sprintf(result_str + len, "%" PRIu64,
-                                (uint64_t)val[i].data.single_elem);
+                                (uint64_t)val[i].data.single_elem.mid);
             }
             len += (size_t)wrote;
         } else if (val[i].n > 1) {
             for (GrB_Index k = 0; k < val[i].n; k++) {
                 if (k == 0) {
-                    if (val[i].data.middle[k] == GrB_INDEX_MAX) {
+                    if (val[i].data.middle[k].mid == GrB_INDEX_MAX) {
                         wrote = sprintf(result_str + len, "INDEX_MAX");
                     } else {
                         wrote = sprintf(result_str + len, "%" PRIu64,
-                                        (uint64_t)val[i].data.middle[k]);
+                                        (uint64_t)val[i].data.middle[k].mid);
                     }
                 } else {
-                    if (val[i].data.middle[k] == GrB_INDEX_MAX) {
+                    if (val[i].data.middle[k].mid == GrB_INDEX_MAX) {
                         wrote = sprintf(result_str + len, ",INDEX_MAX");
                     } else {
                         wrote = sprintf(result_str + len, ",%" PRIu64,
-                                        (uint64_t)val[i].data.middle[k]);
+                                        (uint64_t)val[i].data.middle[k].mid);
                     }
                 }
                 len += (size_t)wrote;
@@ -163,6 +164,7 @@ void free_workspace() {
     LAGraph_CFL_AllPaths_free_outputs(outputs, grammar.nonterms_count, &all_paths_t);
     all_paths_t = NULL;
     outputs = NULL;
+    LAGraph_Free((void **)&rule_table, msg);
     LAGraph_Free((void **)&grammar.rules, msg);
     grammar = (grammar_t){0, 0, 0, NULL};
 }

@@ -1147,6 +1147,7 @@ GrB_Info LAGraph_CFL_AllPaths(
                          // GrB_INDEX_MAX in the array is a special value for A->eps and A->t.
     // AllPaths type - elements of the output matrices.
     GrB_Type *all_paths_ptr_t,      // Pass a pointer to GrB_Type.
+    BinaryRuleInfo **out_rule_table,
     // Input
     const GrB_Matrix *adj_matrices, // Array of adjacency matrices representing the graph.
                                     // The length of this array is equal to the count of

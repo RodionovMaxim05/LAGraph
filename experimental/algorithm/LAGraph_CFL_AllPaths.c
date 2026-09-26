@@ -17,6 +17,7 @@
             LAGraph_Free((void **)&eps_rules, NULL);                                     \
             LAGraph_Free((void **)&term_rules, NULL);                                    \
             LAGraph_Free((void **)&bin_rules, NULL);                                     \
+            LAGraph_Free((void **)&rule_table, NULL);                                    \
         }                                                                                \
         GrB_free(&AllPaths_semiring);                                                    \
         GrB_free(&AllPaths_monoid);                                                      \
@@ -28,6 +29,7 @@
         GrB_free(&AllPaths_add);                                                         \
         GrB_free(&AllPaths_add_get_nvals);                                               \
         GrB_free(&Theta);                                                                \
+        GrB_free(&rule_theta);                                                           \
     }
 
 #define ADD_TO_MSG_ALL_PATHS(...)                                                        \
@@ -44,154 +46,37 @@
 
 #include "LG_internal.h"
 #include <LAGraphX.h>
-
-// Merging two ordered arrays of internal vertices in the add function
-static GrB_Index *merge_all_paths(size_t *n, const GrB_Index *a, const size_t na,
-                                  const GrB_Index *b, const size_t nb) {
-    GrB_Index *tmp = malloc((na + nb) * sizeof(GrB_Index));
-
-    size_t ia = 0, ib = 0, outn = 0;
-    // Handle the first elements of both arrays to initialize tmp and avoid checking if
-    // tmp is empty in the loop
-    if (na > 0 && nb > 0) {
-        if (a[0] < b[0]) {
-            tmp[outn++] = a[ia++];
-        } else if (b[0] < a[0]) {
-            tmp[outn++] = b[ib++];
-        } else {
-            tmp[outn++] = a[ia++];
-            ib++;
-        }
-    } else if (na > 0) {
-        tmp[outn++] = a[ia++];
-    } else {
-        tmp[outn++] = b[ib++];
-    }
-
-    while (ia < na && ib < nb) {
-        GrB_Index va = a[ia];
-        GrB_Index vb = b[ib];
-        if (va < vb) {
-            if (tmp[outn - 1] != va)
-                tmp[outn++] = va;
-            ia++;
-        } else if (vb < va) {
-            if (tmp[outn - 1] != vb)
-                tmp[outn++] = vb;
-            ib++;
-        } else {
-            if (tmp[outn - 1] != va)
-                tmp[outn++] = va;
-            ia++;
-            ib++;
-        }
-    }
-    while (ia < na) {
-        GrB_Index va = a[ia++];
-        if (tmp[outn - 1] != va)
-            tmp[outn++] = va;
-    }
-    while (ib < nb) {
-        GrB_Index vb = b[ib++];
-        if (tmp[outn - 1] != vb)
-            tmp[outn++] = vb;
-    }
-
-    tmp = realloc(tmp, outn * sizeof(GrB_Index));
-    *n = outn;
-
-    return tmp;
-}
-
-static GrB_Index *insert_all_paths(size_t *n, const GrB_Index *arr, size_t len,
-                                   GrB_Index value) {
-    // Array is ordered, so we can use binary search to find the position to insert value
-    size_t l = 0, r = len, m = 0;
-    while (l < r) {
-        m = l + (r - l) / 2;
-        if (arr[m] < value)
-            l = m + 1;
-        else
-            r = m;
-    }
-
-    // If value is already in the array, return the original array
-    if (l < len && arr[l] == value) {
-        GrB_Index *tmp = malloc(len * sizeof(GrB_Index));
-        memcpy(tmp, arr, len * sizeof(GrB_Index));
-        *n = len;
-        return tmp;
-    }
-
-    GrB_Index *tmp = malloc((len + 1) * sizeof(GrB_Index));
-    memcpy(tmp, arr, l * sizeof(GrB_Index));
-    tmp[l] = value;
-    memcpy(tmp + l + 1, arr + l, (len - l) * sizeof(GrB_Index));
-
-    *n = len + 1;
-    return tmp;
-}
-
-static void add_all_paths(AllPathsElem *z, AllPathsElem *x, AllPathsElem *y) {
-    // temp is needed to avoid freeing the memory of z in case z == x or z == y
-    AllPathsElem temp;
-
-    // x->n and y->n are not equal to zero
-    if (x->n == 1 && y->n == 1) {
-        if (x->data.single_elem == y->data.single_elem) {
-            temp.n = 1;
-            temp.data.single_elem = x->data.single_elem;
-        } else {
-            temp.n = 2;
-            temp.data.middle = malloc(2 * sizeof(GrB_Index));
-            if (x->data.single_elem < y->data.single_elem) {
-                temp.data.middle[0] = x->data.single_elem;
-                temp.data.middle[1] = y->data.single_elem;
-            } else {
-                temp.data.middle[0] = y->data.single_elem;
-                temp.data.middle[1] = x->data.single_elem;
-            }
-        }
-    } else if (x->n == 1) {
-        temp.data.middle =
-            insert_all_paths(&temp.n, y->data.middle, y->n, x->data.single_elem);
-    } else if (y->n == 1) {
-        temp.data.middle =
-            insert_all_paths(&temp.n, x->data.middle, x->n, y->data.single_elem);
-    } else {
-        temp.data.middle =
-            merge_all_paths(&temp.n, x->data.middle, x->n, y->data.middle, y->n);
-    }
-
-    if (x->n > 1) {
-        free(x->data.middle);
-    }
-    if (y->n > 1) {
-        free(y->data.middle);
-    }
-
-    *z = temp;
-}
+#include "LAGraph_CFL_AllPaths_internal.h"
 
 static void mult_all_paths(AllPathsElem *z, const AllPathsElem *x, GrB_Index ix,
                            GrB_Index jx, const AllPathsElem *y, GrB_Index iy,
                            GrB_Index jy, const void *theta) {
-    z->data.single_elem = jx;
+    z->data.single_elem.mid = jx;
+    z->data.single_elem.rule_count = 0;
+    z->data.single_elem.rule_id0 = -1;
+    z->data.single_elem.rest.rule_ids_rest = NULL;
     z->n = 1;
 }
 
 static void mult_all_paths_post(AllPathsElem *z, const void *x, GrB_Index ix,
                                 GrB_Index jx, const void *y, GrB_Index iy, GrB_Index jy,
                                 const void *theta) {
-    z->data.single_elem = jx;
+    int32_t rule_id = *(const int32_t *)theta;
+    z->data.single_elem.mid = jx;
+    z->data.single_elem.rule_count = 1;
+    z->data.single_elem.rule_id0 = rule_id;
+    z->data.single_elem.rest.rule_ids_rest = NULL;
     z->n = 1;
 }
 
 static void set_all_paths(AllPathsElem *z, const AllPathsElem *x,
                           const bool *edge_exist) {
-    z->data.single_elem =
+    z->data.single_elem.mid =
         GrB_INDEX_MAX; // A special value to indicate that this path corresponds to a
                        // terminal rule (A->t) or an epsilon rule (A->eps)
+    z->data.single_elem.rule_count = 0;
+    z->data.single_elem.rule_id0 = -1;
+    z->data.single_elem.rest.rule_ids_rest = NULL;
     z->n = 1;
 }
 
@@ -201,7 +86,10 @@ static void set_all_paths(AllPathsElem *z, const AllPathsElem *x,
     "                     const AllPathsElem *y, GrB_Index iy, GrB_Index jy, \n"         \
     "                     const void *theta) \n"                                         \
     "{ \n"                                                                               \
-    "  z->data.single_elem = jx; \n"                                                     \
+    "  z->data.single_elem.mid = jx; \n"                                                 \
+    "  z->data.single_elem.rule_count = 0; \n"                                           \
+    "  z->data.single_elem.rule_id0 = -1; \n"                                            \
+    "  z->data.single_elem.rest.rule_ids_rest = NULL; \n"                                \
     "  z->n = 1; \n"                                                                     \
     "}"
 
@@ -211,7 +99,11 @@ static void set_all_paths(AllPathsElem *z, const AllPathsElem *x,
     "                     const void *y, GrB_Index iy, GrB_Index jy, \n"                 \
     "                     const void *theta) \n"                                         \
     "{ \n"                                                                               \
-    "  z->data.single_elem = jx; \n"                                                     \
+    "  int32_t rule_id = *(const int32_t *)theta; \n"                                    \
+    "  z->data.single_elem.mid = jx; \n"                                                 \
+    "  z->data.single_elem.rule_count = 1; \n"                                           \
+    "  z->data.single_elem.rule_id0 = rule_id; \n"                                       \
+    "  z->data.single_elem.rest.rule_ids_rest = NULL; \n"                                \
     "  z->n = 1; \n"                                                                     \
     "}"
 
@@ -265,6 +157,7 @@ GrB_Info LAGraph_CFL_AllPaths(
                          // special value for A->eps and A->t.
     // AllPaths type - elements of the output matrices.
     GrB_Type *all_paths_ptr_t, // Pass a pointer to GrB_Type.
+    BinaryRuleInfo **out_rule_table,
     // Input
     const GrB_Matrix *adj_matrices, // Array of adjacency matrices representing the graph.
                                     // The length of this array is equal to the count of
@@ -292,6 +185,10 @@ GrB_Info LAGraph_CFL_AllPaths(
     size_t *term_rules = NULL, term_rules_count = 0; // [Variable -> term]
     size_t *bin_rules = NULL, bin_rules_count = 0;   // [Variable -> AB]
 
+    BinaryRuleInfo *rule_table = NULL;
+    size_t rule_table_count = 0;
+    size_t rule_table_cap = 0;
+
     GrB_Matrix identity_matrix = NULL;
     GrB_Vector v_diag = NULL;
 
@@ -308,13 +205,11 @@ GrB_Info LAGraph_CFL_AllPaths(
     GrB_BinaryOp AllPaths_set = NULL;
     GrB_Scalar Theta = NULL;
     GrB_Scalar bottom_scalar = NULL;
+    GrB_Scalar rule_theta = NULL;
 
     GrB_free(all_paths_ptr_t);
     GRB_TRY(GrB_Type_new(all_paths_ptr_t, sizeof(AllPathsElem)));
     AllPaths_type = *all_paths_ptr_t;
-
-    GRB_TRY(GrB_Scalar_new(&Theta, GrB_BOOL));
-    GRB_TRY(GrB_Scalar_setElement_BOOL(Theta, false));
 
     AllPathsElem bottom = {0};
     GRB_TRY(GrB_Scalar_new(&bottom_scalar, AllPaths_type));
@@ -329,20 +224,24 @@ GrB_Info LAGraph_CFL_AllPaths(
         GRB_TRY(GxB_IndexBinaryOp_new(&IAllPaths_mult, (void *)mult_all_paths,
                                       AllPaths_type, AllPaths_type, AllPaths_type,
                                       GrB_BOOL, "mult_all_paths", MULT_PATH_INDEX_DEFN));
+
+        GRB_TRY(GrB_Scalar_new(&Theta, GrB_BOOL));
+        GRB_TRY(GrB_Scalar_setElement_BOOL(Theta, false));
+
+        GRB_TRY(GxB_BinaryOp_new_IndexOp(&AllPaths_mult, IAllPaths_mult, Theta));
+
+        GRB_TRY(GrB_Semiring_new(&AllPaths_semiring, AllPaths_monoid, AllPaths_mult));
     }
     // postprocessing
     else if (mode == 0) {
         GRB_TRY(GxB_IndexBinaryOp_new(&IAllPaths_mult, (void *)mult_all_paths_post,
-                                      AllPaths_type, GrB_BOOL, GrB_BOOL, GrB_BOOL,
+                                      AllPaths_type, GrB_BOOL, GrB_BOOL, GrB_INT32,
                                       "mult_all_paths_post", MULT_PATH_POST_INDEX_DEFN));
+        GRB_TRY(GrB_Scalar_new(&rule_theta, GrB_INT32));
     } else {
         ADD_TO_MSG_ALL_PATHS("Mode must be 0(postprocessing) or 1(CFPQ Core)");
         return GrB_INVALID_VALUE;
     }
-
-    GRB_TRY(GxB_BinaryOp_new_IndexOp(&AllPaths_mult, IAllPaths_mult, Theta));
-
-    GRB_TRY(GrB_Semiring_new(&AllPaths_semiring, AllPaths_monoid, AllPaths_mult));
 
     GRB_TRY(GrB_BinaryOp_new(&AllPaths_set, (void *)set_all_paths, AllPaths_type,
                              AllPaths_type, GrB_BOOL));
@@ -363,6 +262,10 @@ GrB_Info LAGraph_CFL_AllPaths(
 
     // CFPQ core mode
     if (mode == 1) {
+        // Rule provenance isn't tracked in this mode
+        if (out_rule_table) {
+            *out_rule_table = NULL;
+        }
         LG_TRY(LAGraph_CFPQ_core(outputs, adj_matrices, terms_count, nonterms_count,
                                  rules, rules_count, &semiring, msg));
     }
@@ -471,11 +374,32 @@ GrB_Info LAGraph_CFL_AllPaths(
             if (t_empty_flags[bin_rule.prod_A] || t_empty_flags[bin_rule.prod_B])
                 continue;
 
+            int32_t this_rule_id = (int32_t)rule_table_count;
+            LG_TRY(rule_table_push(&rule_table, &rule_table_count, &rule_table_cap,
+                                   (int32_t)bin_rule.nonterm, (int32_t)bin_rule.prod_A,
+                                   (int32_t)bin_rule.prod_B));
+
+            GRB_TRY(GrB_Scalar_setElement_INT32(rule_theta, this_rule_id));
+
+            GrB_BinaryOp rule_mult;
+            GRB_TRY(GxB_BinaryOp_new_IndexOp(&rule_mult, IAllPaths_mult, rule_theta));
+
+            GrB_Semiring rule_semiring;
+            GRB_TRY(GrB_Semiring_new(&rule_semiring, AllPaths_monoid, rule_mult));
+
             GrB_BinaryOp acc_op =
                 t_empty_flags[bin_rule.nonterm] ? GrB_NULL : semiring.add;
-            GRB_TRY(GrB_mxm(T[bin_rule.nonterm], GrB_NULL, acc_op, semiring.semiring,
+            GRB_TRY(GrB_mxm(T[bin_rule.nonterm], GrB_NULL, acc_op, rule_semiring,
                             outputs_reachability[bin_rule.prod_A],
                             outputs_reachability[bin_rule.prod_B], GrB_NULL))
+
+            GrB_free(&rule_semiring);
+            GrB_free(&rule_mult);
+        }
+
+        if (out_rule_table) {
+            *out_rule_table = rule_table;
+            rule_table = NULL;
         }
 
         for (size_t i = 0; i < nonterms_count; i++) {
@@ -500,9 +424,7 @@ static void free_AllPaths_matrix(GrB_Matrix *ptr_output) {
 
     while (info != GxB_EXHAUSTED) {
         GxB_Iterator_get_UDT(iterator, (void *)&val);
-        if (val.n > 1 && val.data.middle != NULL) {
-            free(val.data.middle);
-        }
+        free_all_paths_elem_internal(&val);
         info = GxB_Matrix_Iterator_next(iterator);
     }
 
