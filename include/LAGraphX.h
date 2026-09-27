@@ -1496,6 +1496,16 @@ enum {
     LAGraph_EWNCF_INDEX_PROD_B = 1 << 2,
 };
 
+typedef struct {
+    int32_t S_operand_base;
+    int64_t S_stride;
+    int32_t S_target_base;
+    int64_t N;
+    int64_t *active_masks;
+    int32_t *p_ids;
+    int64_t active_masks_count;
+} XorFamilyRouting;
+
 // Production rule of Context-free grammar in Extended Weak Chomsky Normal Form
 //
 // All grammar symbols (terminal and nonterminals) are presented by natural numbers from range [0; symbols_amount).
@@ -1577,6 +1587,7 @@ enum {
     int32_t prod_B;        // second RHS symbol id or -1
     uint32_t indexed_count; // Number of indexed rules (zero if not indexed)
     uint8_t indexed;        // Bitmask of indexed symbols
+    XorFamilyRouting *xor_routing;
 } LAGraph_rule_EWCNF;
 
 // LAGraph_CFL_reachability: Context-Free Language Reachability Matrix-Based Algorithm

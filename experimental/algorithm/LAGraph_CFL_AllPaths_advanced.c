@@ -254,30 +254,73 @@ GrB_Info LAGraph_CFL_AllPaths_adv(GrB_Matrix *outputs, GrB_Type *all_paths_ptr_t
     for (size_t i = 0; i < bin_rules_count; i++) {
         LAGraph_rule_EWCNF bin_rule = new_rules[bin_rules[i]];
 
-        if (t_empty_flags[bin_rule.prod_A] || t_empty_flags[bin_rule.prod_B])
-            continue;
+        if (bin_rule.xor_routing != NULL) {
+            XorFamilyRouting *rt = bin_rule.xor_routing;
 
-        int32_t this_rule_id = (int32_t)rule_table_count;
-        LG_TRY(rule_table_push(&rule_table, &rule_table_count, &rule_table_cap,
-                        bin_rule.nonterm, bin_rule.prod_A, bin_rule.prod_B));
+            for (int64_t idx_m = 0; idx_m < rt->active_masks_count; idx_m++) {
+                int64_t im = rt->active_masks[idx_m];
+                int32_t p_id = rt->p_ids[idx_m];
 
-        GRB_TRY(GrB_Scalar_setElement_INT32(rule_theta, this_rule_id));
+                for (int64_t m = 0; m < rt->N; m++) {
+                    int64_t next = m ^ im;
+                    int32_t cur_A = rt->S_target_base + (int32_t)(m * rt->S_stride);
+                    int32_t cur_pA = p_id;
+                    int32_t cur_pB = rt->S_operand_base + (int32_t)(next * rt->S_stride);
 
-        GrB_BinaryOp rule_mult;
-        GRB_TRY(GxB_BinaryOp_new_IndexOp(&rule_mult, IAllPaths_mult, rule_theta));
+                    if (t_empty_flags[cur_pA] || t_empty_flags[cur_pB])
+                        continue;
 
-        GrB_Semiring rule_semiring;
-        GRB_TRY(GrB_Semiring_new(&rule_semiring, AllPaths_monoid, rule_mult));
+                    int32_t this_rule_id = (int32_t)rule_table_count;
+                    LG_TRY(rule_table_push(&rule_table, &rule_table_count,
+                                           &rule_table_cap, cur_A, cur_pA, cur_pB));
 
-        GrB_BinaryOp acc_op = t_empty_flags[bin_rule.nonterm] ? GrB_NULL : AllPaths_add;
-        GRB_TRY(GrB_mxm(T[bin_rule.nonterm], GrB_NULL, acc_op, rule_semiring,
-                        outputs_reachability[bin_rule.prod_A],
-                        outputs_reachability[bin_rule.prod_B], GrB_NULL));
+                    GRB_TRY(GrB_Scalar_setElement_INT32(rule_theta, this_rule_id));
 
-        GrB_free(&rule_semiring);
-        GrB_free(&rule_mult);
+                    GrB_BinaryOp rule_mult;
+                    GRB_TRY(
+                        GxB_BinaryOp_new_IndexOp(&rule_mult, IAllPaths_mult, rule_theta));
 
-        t_empty_flags[bin_rule.nonterm] = false;
+                    GrB_Semiring rule_semiring;
+                    GRB_TRY(GrB_Semiring_new(&rule_semiring, AllPaths_monoid, rule_mult));
+
+                    GrB_BinaryOp acc_op = t_empty_flags[cur_A] ? GrB_NULL : AllPaths_add;
+
+                    GRB_TRY(GrB_mxm(T[cur_A], GrB_NULL, acc_op, rule_semiring,
+                                    outputs_reachability[cur_pA],
+                                    outputs_reachability[cur_pB], GrB_NULL));
+
+                    GrB_free(&rule_semiring);
+                    GrB_free(&rule_mult);
+
+                    t_empty_flags[cur_A] = false;
+                }
+            }
+        } else {
+            if (t_empty_flags[bin_rule.prod_A] || t_empty_flags[bin_rule.prod_B])
+                continue;
+
+            int32_t this_rule_id = (int32_t)rule_table_count;
+            LG_TRY(rule_table_push(&rule_table, &rule_table_count, &rule_table_cap,
+                            bin_rule.nonterm, bin_rule.prod_A, bin_rule.prod_B));
+
+            GRB_TRY(GrB_Scalar_setElement_INT32(rule_theta, this_rule_id));
+
+            GrB_BinaryOp rule_mult;
+            GRB_TRY(GxB_BinaryOp_new_IndexOp(&rule_mult, IAllPaths_mult, rule_theta));
+
+            GrB_Semiring rule_semiring;
+            GRB_TRY(GrB_Semiring_new(&rule_semiring, AllPaths_monoid, rule_mult));
+
+            GrB_BinaryOp acc_op = t_empty_flags[bin_rule.nonterm] ? GrB_NULL : AllPaths_add;
+            GRB_TRY(GrB_mxm(T[bin_rule.nonterm], GrB_NULL, acc_op, rule_semiring,
+                            outputs_reachability[bin_rule.prod_A],
+                            outputs_reachability[bin_rule.prod_B], GrB_NULL));
+
+            GrB_free(&rule_semiring);
+            GrB_free(&rule_mult);
+
+            t_empty_flags[bin_rule.nonterm] = false;
+        }
     }
 
     if (out_rule_table) {
