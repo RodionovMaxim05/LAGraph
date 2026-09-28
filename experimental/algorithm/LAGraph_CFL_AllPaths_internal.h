@@ -4,10 +4,12 @@
 #include "LG_internal.h"
 #include <LAGraphX.h>
 
+// Checks whether the MidEntry structure uses heap memory to store additional rule IDs
 static inline bool mid_entry_uses_heap(const MidEntry *e) {
     return e->rule_count > MID_ENTRY_INLINE_CAP + 1;
 }
 
+// Retrieves the k-th additional rule ID from either inline array or heap allocation
 static inline int32_t mid_entry_rest_id(const MidEntry *e, uint32_t k) {
     if (mid_entry_uses_heap(e)) {
         return e->rest.rule_ids_rest[k];
@@ -15,6 +17,7 @@ static inline int32_t mid_entry_rest_id(const MidEntry *e, uint32_t k) {
     return e->rest.inline_ids[k];
 }
 
+// Frees heap-allocated rule ID array inside a MidEntry structure if allocated
 static inline void free_mid_entry_contents(MidEntry *entry) {
     if (entry == NULL)
         return;
@@ -24,6 +27,8 @@ static inline void free_mid_entry_contents(MidEntry *entry) {
     entry->rest.rule_ids_rest = NULL;
 }
 
+// Adds a rule ID to MidEntry, avoiding duplicates and transitioning to heap allocation
+// when inline capacity is exceeded
 static void mid_entry_add_rule(MidEntry *e, int32_t rule_id) {
     if (e->rule_count == 0) {
         e->rule_id0 = rule_id;
@@ -47,6 +52,7 @@ static void mid_entry_add_rule(MidEntry *e, int32_t rule_id) {
             return;
         }
 
+        // Allocate heap memory when inline capacity is exceeded
         int32_t *heap = malloc((extra + 1) * sizeof(int32_t));
         memcpy(heap, e->rest.inline_ids, extra * sizeof(int32_t));
         heap[extra] = rule_id;
@@ -66,6 +72,7 @@ static void mid_entry_add_rule(MidEntry *e, int32_t rule_id) {
     e->rule_count++;
 }
 
+// Merges all rule IDs from src MidEntry into dst MidEntry
 static void mid_entry_merge_rules(MidEntry *dst, const MidEntry *src) {
     if (src->rule_count == 0)
         return;
@@ -76,12 +83,14 @@ static void mid_entry_merge_rules(MidEntry *dst, const MidEntry *src) {
     }
 }
 
+// Retrieves allocated capacity stored in hidden header prefix before middle array
 static inline size_t get_middle_cap(const MidEntry *middle) {
     if (middle == NULL)
         return 0;
     return ((const size_t *)middle)[-1];
 }
 
+// Allocates array of MidEntry elements with a capacity header prefix
 static inline MidEntry *alloc_middle(size_t cap) {
     size_t *raw = malloc(sizeof(size_t) + cap * sizeof(MidEntry));
     if (!raw)
@@ -90,6 +99,7 @@ static inline MidEntry *alloc_middle(size_t cap) {
     return (MidEntry *)(raw + 1);
 }
 
+// Reallocates array of MidEntry elements preserving the capacity header prefix
 static inline MidEntry *realloc_middle(MidEntry *middle, size_t new_cap) {
     if (middle == NULL)
         return alloc_middle(new_cap);
@@ -101,6 +111,7 @@ static inline MidEntry *realloc_middle(MidEntry *middle, size_t new_cap) {
     return (MidEntry *)(new_raw + 1);
 }
 
+// Frees array of MidEntry elements including its capacity header prefix
 static inline void free_middle(MidEntry *middle) {
     if (middle == NULL)
         return;
@@ -108,6 +119,7 @@ static inline void free_middle(MidEntry *middle) {
     free(raw);
 }
 
+// Calculates next capacity growth step for AllPathsElem middle array
 static inline size_t all_paths_next_cap(size_t cur_cap, size_t need) {
     size_t cap = (cur_cap == 0) ? 4 : cur_cap;
     while (cap < need) {
@@ -116,6 +128,7 @@ static inline size_t all_paths_next_cap(size_t cur_cap, size_t need) {
     return cap;
 }
 
+// Helper function to free internal dynamic memory allocated inside AllPathsElem
 static void free_all_paths_elem_internal(AllPathsElem *elem) {
     if (elem == NULL || elem->n == 0)
         return;
@@ -132,10 +145,12 @@ static void free_all_paths_elem_internal(AllPathsElem *elem) {
     elem->n = 0;
 }
 
+// Inserts or merges a MidEntry into the ordered middle array of AllPathsElem
 static void insert_all_paths(AllPathsElem *elem, MidEntry *value) {
     MidEntry *arr = elem->data.middle;
     size_t len = elem->n;
 
+    // Array is ordered, so we can use binary search to find the position to insert value
     size_t l = 0, r = len;
     while (l < r) {
         size_t m = l + (r - l) / 2;
@@ -145,6 +160,7 @@ static void insert_all_paths(AllPathsElem *elem, MidEntry *value) {
             r = m;
     }
 
+    // If mid vertex is already in the array, merge rules and free value's dynamic resources
     if (l < len && arr[l].mid == value->mid) {
         mid_entry_merge_rules(&arr[l], value);
         free_mid_entry_contents(value);
@@ -165,6 +181,7 @@ static void insert_all_paths(AllPathsElem *elem, MidEntry *value) {
     elem->n = len + 1;
 }
 
+// Merging two ordered arrays of MidEntry intermediate vertices in the add function
 static MidEntry *merge_all_paths(size_t *out_n, MidEntry *a, size_t na,
                                         MidEntry *b, size_t nb) {
     size_t alloc_cap = na + nb;
@@ -193,6 +210,7 @@ static MidEntry *merge_all_paths(size_t *out_n, MidEntry *a, size_t na,
     return tmp;
 }
 
+// Combines two AllPathsElem elements during addition in the monoid
 static void add_all_paths(AllPathsElem *z, AllPathsElem *x, AllPathsElem *y) {
     if (x->n == 0) {
         *z = *y;
@@ -212,6 +230,9 @@ static void add_all_paths(AllPathsElem *z, AllPathsElem *x, AllPathsElem *y) {
             z->n = 1;
             z->data.single_elem = xs;
         } else {
+            // Pre-size the array a bit above the 2 entries actually used, so
+            // that a subsequent insert_all_paths() does not need to grow it
+            // immediately.
             MidEntry lo = (xs.mid < ys.mid) ? xs : ys;
             MidEntry hi = (xs.mid < ys.mid) ? ys : xs;
             size_t cap = 4;
@@ -242,6 +263,7 @@ static void add_all_paths(AllPathsElem *z, AllPathsElem *x, AllPathsElem *y) {
     z->data.middle = merged;
 }
 
+// Appends binary rule info (nonterm -> B C) to the dynamic rule table array
 static inline GrB_Info rule_table_push(BinaryRuleInfo **table, size_t *count, size_t *cap,
                                        int32_t nonterm, int32_t B, int32_t C) {
     if (*count == *cap) {

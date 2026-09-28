@@ -28,6 +28,7 @@
 #include <LAGraphX.h>
 #include "LAGraph_CFL_AllPaths_internal.h"
 
+// Post-multiplication operation creating path element containing intermediate vertex jx and rule_id
 static void mult_all_paths_post(AllPathsElem *z, const void *x, GrB_Index ix,
                                 GrB_Index jx, const void *y, GrB_Index iy, GrB_Index jy,
                                 const void *theta) {
@@ -39,6 +40,7 @@ static void mult_all_paths_post(AllPathsElem *z, const void *x, GrB_Index ix,
     z->n = 1;
 }
 
+// Initializer for terminal or epsilon rules path element
 static void set_all_paths(AllPathsElem *z, const AllPathsElem *x,
                           const bool *edge_exist) {
     z->data.single_elem.mid = GrB_INDEX_MAX; // A special value to indicate that this path corresponds to a
@@ -255,6 +257,8 @@ GrB_Info LAGraph_CFL_AllPaths_adv(GrB_Matrix *outputs, GrB_Type *all_paths_ptr_t
         LAGraph_rule_EWCNF bin_rule = new_rules[bin_rules[i]];
 
         if (bin_rule.xor_routing != NULL) {
+            // Handle rules using xor_routing optimization family
+
             XorFamilyRouting *rt = bin_rule.xor_routing;
 
             for (int64_t idx_m = 0; idx_m < rt->active_masks_count; idx_m++) {
@@ -296,6 +300,8 @@ GrB_Info LAGraph_CFL_AllPaths_adv(GrB_Matrix *outputs, GrB_Type *all_paths_ptr_t
                 }
             }
         } else {
+            // Standard binary rule processing
+
             if (t_empty_flags[bin_rule.prod_A] || t_empty_flags[bin_rule.prod_B])
                 continue;
 

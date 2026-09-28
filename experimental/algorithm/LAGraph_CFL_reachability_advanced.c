@@ -557,6 +557,22 @@ static GrB_Info get_new_adj_matrices(const GrB_Matrix *adj_matrices, CFL_Symbol 
     return GrB_SUCCESS;
 }
 
+// The mutable, algorithm-owned counterpart of a grammar-supplied `XorFamilyRouting`
+// (`spec`). One instance is created per rule that has `xor_routing != NULL`.
+//
+// Without OPT_BLOCK (`resolved_p_ids == NULL`):
+//   Only `spec` is set. Symbol ids are not renumbered in this mode, so algorithm reads
+//  `S_operand_base`/`S_target_base`/`active_masks`/`p_ids` straight out of `spec`.
+//
+// With OPT_BLOCK (`resolved_p_ids != NULL`):
+//   Nonterminals get grouped/renumbered before the algorithm runs, so the symbol ids
+//   baked into `spec` are stale. This runtime pre-computes their remapped equivalents
+//   once, up front:
+//     resolved_S_operand[m], resolved_S_target[m] — remapped symbol id of family member
+//        `m`, for m in [0, spec->N).
+//     masks, resolved_p_ids, masks_count — `spec->active_masks`/`p_ids` after remapping
+//        the P-operand ids and deduplicating any (mask, p_id) pairs that collided under
+//        the renumbering (owned copies, since `spec`'s arrays must stay untouched).
 typedef struct {
     const XorFamilyRouting *spec;
     int32_t *resolved_S_operand;
@@ -566,6 +582,17 @@ typedef struct {
     int64_t masks_count;
 } XorFamilyRoutingRuntime;
 
+// Several rules can define XOR families that share the same
+// (S_operand_base, S_target_base, S_stride, N) — i.e. they route into the very same
+// S_operand/S_target index space, just contributing different (mask, P) terms. Rather
+// than evaluating each such rule's family separately, all of them are merged into one
+// XorFamilyGroup, so `xor_family_apply_phase_group()` does a single pass over the
+// combined term list per group per fixpoint iteration instead of one pass per rule.
+//
+// active_masks/p_ids/resolved_p_ids are the concatenation of every contributing rule's
+// terms (from spec, or from the rule's XorFamilyRoutingRuntime under OPT_BLOCK);
+// resolved_S_operand/resolved_S_target are borrowed from any one member's runtime,
+// since by construction they are identical across the whole group.
 typedef struct {
     int32_t S_operand_base, S_target_base;
     int64_t S_stride;
@@ -577,6 +604,8 @@ typedef struct {
     int32_t *resolved_S_operand, *resolved_S_target;
 } XorFamilyGroup;
 
+// Builds the "no remapping needed" runtime for a rule's `xor_routing`,
+// used when `OPT_BLOCK` is off.
 static GrB_Info create_xor_runtime_unblocked(const XorFamilyRouting *spec,
                                            XorFamilyRoutingRuntime **out, char *msg) {
     XorFamilyRoutingRuntime *rt;
@@ -586,6 +615,11 @@ static GrB_Info create_xor_runtime_unblocked(const XorFamilyRouting *spec,
     return GrB_SUCCESS;
 }
 
+// Builds the `OPT_BLOCK` runtime for a rule's `xor_routing`.
+// Under `OPT_BLOCK`, indexed nonterminals get grouped into wider block matrices and
+// renumbered, so every symbol id that `spec` refers to (the S_operand/S_target family
+// members and every P-operand in `p_ids`) has to be looked up through
+// `map_lookup_base()` once here.
 static GrB_Info create_xor_runtime_blocked(const XorFamilyRouting *spec, CFL_Symbol *map,
                                          size_t map_size, XorFamilyRoutingRuntime **out,
                                          char *msg) {
@@ -611,6 +645,7 @@ static GrB_Info create_xor_runtime_blocked(const XorFamilyRouting *spec, CFL_Sym
     TRY_INNER(
         LAGraph_Malloc((void **)&rt->resolved_S_target, spec->N, sizeof(int32_t), msg));
 
+    // Resolve each family member's operand/target symbol id once, up front
     for (int64_t m = 0; m < spec->N; m++) {
         rt->resolved_S_operand[m] = map_lookup_base(
             spec->S_operand_base + (int32_t)(m * spec->S_stride), map, map_size);
@@ -627,6 +662,8 @@ static GrB_Info create_xor_runtime_blocked(const XorFamilyRouting *spec, CFL_Sym
         return GrB_OUT_OF_MEMORY;
     }
 
+    // Remap every P-operand id and collapse consecutive duplicate
+    // (mask, p_id) pairs that the remapping produced
     int64_t out_n = 0;
     for (int64_t idx_m = 0; idx_m < spec->active_masks_count; idx_m++) {
         int64_t im = spec->active_masks[idx_m];
@@ -650,6 +687,8 @@ static GrB_Info create_xor_runtime_blocked(const XorFamilyRouting *spec, CFL_Sym
 // Parameters:
 //   new_rules       - [out] Allocated output rule array. Caller must free
 //   new_rules_count - [out] Number of rules written to new_rules
+//   out_routing     - [out] Allocated array, parallel to new_rules, of
+//                     XorFamilyRoutingRuntime* (or NULL per rule).
 static GrB_Info get_new_rules(const LAGraph_rule_EWCNF *rules, size_t rules_count,
                               CFL_Symbol *map, size_t map_size,
                               LAGraph_rule_EWCNF **new_rules, size_t *new_rules_count,
@@ -718,6 +757,11 @@ typedef struct {
     bool occupied;
 } PIdCacheEntry;
 
+// Returns the base matrix backing a P-operand, memoized per `p_id` in `cache`
+// (a simple open-addressed hash table local to one `xor_family_apply_phase_group` call).
+// Multiple family members can reference the same P-operand across different masks, and
+// under `OPT_BLOCK` the same *un-blocked* base matrix is shared by every block member
+// as well.
 static GrB_Info get_cached_p_base(int32_t p_id, bool is_blocked, CFL_Matrix *operand,
                                   GrB_Index n, int8_t optimizations, PIdCacheEntry *cache,
                                   size_t cache_capacity, CFL_Matrix **out_p_base) {
@@ -796,6 +840,22 @@ static GrB_Info get_cached_p_base(int32_t p_id, bool is_blocked, CFL_Matrix *ope
     return GrB_SUCCESS;
 }
 
+// Evaluates one XorFamilyGroup for one phase of the [Variable -> A B] fixpoint step
+// (`phase2` picks which side is "delta" this iteration — the same two-phase split the
+// ordinary per-rule CFL_mxm calls elsewhere in the main loop use).
+//
+// A group bundles several (mask, P-operand) terms that all feed the same
+// S_operand/S_target family. Handling them mask by mask turns what would otherwise be
+// one matrix multiply per (mask, P, family member) triple into one multiply per distinct
+// mask, covering all N family members at once:
+//   1. OR together every P-operand that shares a given mask.
+//   2. Concatenate the N S_operand tiles side by side, but permuted so that column-block
+//      m holds the tile for member (m XOR mask) — this is what lines up "family member
+//      m" with "the operand it actually needs" for that mask, in a single wide matrix.
+//   3. One multiply per mask against that permutation, accumulated across masks, gives
+//      every family member's update in one pass.
+//   4. Split the wide result back into per-member tiles and OR each into
+//      temp_matrices[S_target[m]], same as an ordinary rule's output.
 GrB_Info xor_family_apply_phase_group(XorFamilyGroup *group, bool phase2,
                                       CFL_Matrix **matrices, CFL_Matrix **delta_matrices,
                                       CFL_Matrix **temp_matrices, int8_t optimizations) {
@@ -846,6 +906,8 @@ GrB_Info xor_family_apply_phase_group(XorFamilyGroup *group, bool phase2,
         }                                                                               \
     }
 
+    // Gather the base matrix of every S_operand family member once; these are reused,
+    // permuted by mask, for every distinct `im` below.
     for (size_t m = 0; m < N; m++) {
         int32_t s_id = is_blocked ? group->resolved_S_operand[m]
                                : group->S_operand_base + (int32_t)(m * group->S_stride);
@@ -868,6 +930,10 @@ GrB_Info xor_family_apply_phase_group(XorFamilyGroup *group, bool phase2,
         return GrB_OUT_OF_MEMORY;
     }
 
+    // Reduce every (mask, P-operand) term of the group down to one matrix per distinct
+    // mask: reduced_by_im[im] = OR of P[p]'s base matrix over every term that shares
+    // mask `im`. This is what lets all N family members be updated together per mask,
+    // instead of once per term.
     for (int64_t idx = 0; idx < group->total_count; idx++) {
         int64_t im = group->active_masks[idx];
         int32_t p_id = is_blocked ? group->resolved_p_ids[idx] : group->p_ids[idx];
@@ -896,6 +962,11 @@ GrB_Info xor_family_apply_phase_group(XorFamilyGroup *group, bool phase2,
 
     TRY_INNER(CFL_matrix_create(&Result_wide_cfl, n, N * n));
 
+    // For every mask that actually occurs, multiply its reduced P-operand by all N
+    // operand tiles at once, permuted so that slot `m` holds S_operand[m ^ im] — this is
+    // the concat/mxm/split trick that implements
+    // "S_target[m] |= P[im] . S_operand[m ^ im] for every m" as a single wide
+    // multiplication instead of N separate ones.
     for (int64_t im = 0; im < N; im++) {
         if (reduced_by_im[im] == NULL) {
             continue;
@@ -1229,6 +1300,9 @@ GrB_Info LAGraph_CFL_reachability_adv(
         TRY(CFL_wise(nonterm_matrix, nonterm_matrix, iden, true, optimizations));
     }
 
+    // Build `XorFamilyGroups` out of every bin_rule that carries a routing runtime.
+    // Rules whose routing has already been resolved to the same
+    // (S_operand_base, S_target_base, S_stride, N) are merged into one group.
     for (size_t i = 0; i < bin_rules_count; i++) {
         size_t rule_idx = bin_rules[i];
         XorFamilyRoutingRuntime *rt = rule_routing[rule_idx];

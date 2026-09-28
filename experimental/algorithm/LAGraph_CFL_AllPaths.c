@@ -48,6 +48,8 @@
 #include <LAGraphX.h>
 #include "LAGraph_CFL_AllPaths_internal.h"
 
+// Index binary multiplication operator for CFPQ core mode (mode 1)
+// Constructs a path element tracking the intermediate matrix column index jx
 static void mult_all_paths(AllPathsElem *z, const AllPathsElem *x, GrB_Index ix,
                            GrB_Index jx, const AllPathsElem *y, GrB_Index iy,
                            GrB_Index jy, const void *theta) {
@@ -58,6 +60,8 @@ static void mult_all_paths(AllPathsElem *z, const AllPathsElem *x, GrB_Index ix,
     z->n = 1;
 }
 
+// Index binary multiplication operator for postprocessing mode (mode 0)
+// Constructs a path element tracking intermediate node jx and binary rule ID from theta
 static void mult_all_paths_post(AllPathsElem *z, const void *x, GrB_Index ix,
                                 GrB_Index jx, const void *y, GrB_Index iy, GrB_Index jy,
                                 const void *theta) {
@@ -69,6 +73,7 @@ static void mult_all_paths_post(AllPathsElem *z, const void *x, GrB_Index ix,
     z->n = 1;
 }
 
+// Binary operator callback for initializing base-case paths (terminal and epsilon transitions)
 static void set_all_paths(AllPathsElem *z, const AllPathsElem *x,
                           const bool *edge_exist) {
     z->data.single_elem.mid =
@@ -157,7 +162,7 @@ GrB_Info LAGraph_CFL_AllPaths(
                          // special value for A->eps and A->t.
     // AllPaths type - elements of the output matrices.
     GrB_Type *all_paths_ptr_t, // Pass a pointer to GrB_Type.
-    BinaryRuleInfo **out_rule_table,
+    BinaryRuleInfo **out_rule_table, // Pointer to store output binary rule metadata table.
     // Input
     const GrB_Matrix *adj_matrices, // Array of adjacency matrices representing the graph.
                                     // The length of this array is equal to the count of

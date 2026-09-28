@@ -1100,34 +1100,38 @@ GrB_Info LAGraph_CFPQ_core
     char *msg // Message string for error reporting.
 );
 
+// Capacity limit for inline rule ID storage before falling back to heap allocation
 #define MID_ENTRY_INLINE_CAP 2
 
+// Intermediate vertex entry storing derivation rule provenance and middle node index
 typedef struct
 {
-    GrB_Index mid;
-    uint32_t rule_count;
-    int32_t rule_id0;
+    GrB_Index mid;                                // Intermediate vertex index
+    uint32_t rule_count;                          // Total count of associated rule IDs
+    int32_t rule_id0;                             // Primary rule ID (-1 if unassigned)
     union {
-        int32_t inline_ids[MID_ENTRY_INLINE_CAP];
-        int32_t *rule_ids_rest;
+        int32_t inline_ids[MID_ENTRY_INLINE_CAP]; // Inline storage for small rule sets
+        int32_t *rule_ids_rest;                   // Dynamic heap array for additional rule IDs
     } rest;
 } MidEntry;
 
+// Type element representing path derivation sets in matrices
 typedef struct
 {
-    size_t n;
+    size_t n;                 // Number of intermediate vertex entries (0 = empty, 1 = single_elem, >1 = middle)
     union
     {
-        MidEntry single_elem;
-        MidEntry *middle;
+        MidEntry single_elem; // Direct element storage for a single path entry
+        MidEntry *middle;     // Dynamic ordered array of path entries for multiple paths
     } data;
 } AllPathsElem;
 
+// Represents a binary grammar production rule (nonterm -> B C) in EWCNF
 typedef struct
 {
-    int32_t nonterm;
-    int32_t B;
-    int32_t C;
+    int32_t nonterm; // Head non-terminal index (A)
+    int32_t B;       // First body non-terminal index
+    int32_t C;       // Second body non-terminal index
 } BinaryRuleInfo;
 
 // all_paths_ptr_t is a pointer to the type of elements of the outputs matrices.
@@ -1147,7 +1151,7 @@ GrB_Info LAGraph_CFL_AllPaths(
                          // GrB_INDEX_MAX in the array is a special value for A->eps and A->t.
     // AllPaths type - elements of the output matrices.
     GrB_Type *all_paths_ptr_t,      // Pass a pointer to GrB_Type.
-    BinaryRuleInfo **out_rule_table,
+    BinaryRuleInfo **out_rule_table, // Pointer to store output binary rule metadata table.
     // Input
     const GrB_Matrix *adj_matrices, // Array of adjacency matrices representing the graph.
                                     // The length of this array is equal to the count of
@@ -1497,13 +1501,13 @@ enum {
 };
 
 typedef struct {
-    int32_t S_operand_base;
-    int64_t S_stride;
-    int32_t S_target_base;
-    int64_t N;
-    int64_t *active_masks;
-    int32_t *p_ids;
-    int64_t active_masks_count;
+    int32_t S_operand_base;     // Base symbol id of the operand family
+    int64_t S_stride;           // Symbol id spacing between family member m and m+1
+    int32_t S_target_base;      // Base symbol id of the target family
+    int64_t N;                  // Number of family members (parity states)
+    int64_t *active_masks;      // active_masks[idx] = XOR mask `im` for term idx
+    int32_t *p_ids;             // p_ids[idx] = symbol id of the P-operand for term idx
+    int64_t active_masks_count; // Number of (mask, P) terms in the family
 } XorFamilyRouting;
 
 // Production rule of Context-free grammar in Extended Weak Chomsky Normal Form
@@ -1582,12 +1586,12 @@ typedef struct {
 //   N -> eps
 //   and indexed rules.
  typedef struct {
-    int32_t nonterm;       // LHS nonterminal symbol id
-    int32_t prod_A;        // first RHS symbol id or -1
-    int32_t prod_B;        // second RHS symbol id or -1
-    uint32_t indexed_count; // Number of indexed rules (zero if not indexed)
-    uint8_t indexed;        // Bitmask of indexed symbols
-    XorFamilyRouting *xor_routing;
+    int32_t nonterm;               // LHS nonterminal symbol id
+    int32_t prod_A;                // first RHS symbol id or -1
+    int32_t prod_B;                // second RHS symbol id or -1
+    uint32_t indexed_count;        // Number of indexed rules (zero if not indexed)
+    uint8_t indexed;               // Bitmask of indexed symbols
+    XorFamilyRouting *xor_routing; // NULL, or a XOR-family routing layered on top of this rule
 } LAGraph_rule_EWCNF;
 
 // LAGraph_CFL_reachability: Context-Free Language Reachability Matrix-Based Algorithm
