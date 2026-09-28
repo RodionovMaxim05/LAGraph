@@ -230,13 +230,9 @@ static void add_all_paths(AllPathsElem *z, AllPathsElem *x, AllPathsElem *y) {
             z->n = 1;
             z->data.single_elem = xs;
         } else {
-            // Pre-size the array a bit above the 2 entries actually used, so
-            // that a subsequent insert_all_paths() does not need to grow it
-            // immediately.
             MidEntry lo = (xs.mid < ys.mid) ? xs : ys;
             MidEntry hi = (xs.mid < ys.mid) ? ys : xs;
-            size_t cap = 4;
-            MidEntry *arr = alloc_middle(cap);
+            MidEntry *arr = alloc_middle(2);
             arr[0] = lo;
             arr[1] = hi;
             z->n = 2;
