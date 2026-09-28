@@ -21,6 +21,7 @@
         GrB_free(&AllPaths_set);                                                         \
         GrB_free(&AllPaths_add);                                                         \
         GrB_free(&rule_theta);                                                           \
+        GrB_free(&desc_s);                                                               \
         LAGraph_Free((void **)&rule_table, NULL);                                        \
     }
 
@@ -100,6 +101,7 @@ GrB_Info LAGraph_CFL_AllPaths_adv(GrB_Matrix *outputs, GrB_Type *all_paths_ptr_t
     GrB_BinaryOp AllPaths_set = NULL;
     GrB_Scalar bottom_scalar = NULL;
     GrB_Scalar rule_theta = NULL;
+    GrB_Descriptor desc_s = NULL;
 
     GrB_free(all_paths_ptr_t);
     GRB_TRY(
@@ -253,6 +255,9 @@ GrB_Info LAGraph_CFL_AllPaths_adv(GrB_Matrix *outputs, GrB_Type *all_paths_ptr_t
 
     GRB_TRY(GrB_Scalar_new(&rule_theta, GrB_INT32));
 
+    GRB_TRY(GrB_Descriptor_new(&desc_s));
+    GRB_TRY(GrB_Descriptor_set(desc_s, GrB_MASK, GrB_STRUCTURE));
+
     for (size_t i = 0; i < bin_rules_count; i++) {
         LAGraph_rule_EWCNF bin_rule = new_rules[bin_rules[i]];
 
@@ -289,9 +294,9 @@ GrB_Info LAGraph_CFL_AllPaths_adv(GrB_Matrix *outputs, GrB_Type *all_paths_ptr_t
 
                     GrB_BinaryOp acc_op = t_empty_flags[cur_A] ? GrB_NULL : AllPaths_add;
 
-                    GRB_TRY(GrB_mxm(T[cur_A], GrB_NULL, acc_op, rule_semiring,
-                                    outputs_reachability[cur_pA],
-                                    outputs_reachability[cur_pB], GrB_NULL));
+                    GRB_TRY(GrB_mxm(T[cur_A], outputs_reachability[cur_A], acc_op,
+                        rule_semiring, outputs_reachability[cur_pA],
+                        outputs_reachability[cur_pB], desc_s));
 
                     GrB_free(&rule_semiring);
                     GrB_free(&rule_mult);
@@ -318,9 +323,9 @@ GrB_Info LAGraph_CFL_AllPaths_adv(GrB_Matrix *outputs, GrB_Type *all_paths_ptr_t
             GRB_TRY(GrB_Semiring_new(&rule_semiring, AllPaths_monoid, rule_mult));
 
             GrB_BinaryOp acc_op = t_empty_flags[bin_rule.nonterm] ? GrB_NULL : AllPaths_add;
-            GRB_TRY(GrB_mxm(T[bin_rule.nonterm], GrB_NULL, acc_op, rule_semiring,
-                            outputs_reachability[bin_rule.prod_A],
-                            outputs_reachability[bin_rule.prod_B], GrB_NULL));
+            GRB_TRY(GrB_mxm(T[bin_rule.nonterm], outputs_reachability[bin_rule.nonterm],
+                acc_op, rule_semiring, outputs_reachability[bin_rule.prod_A],
+                outputs_reachability[bin_rule.prod_B], desc_s));
 
             GrB_free(&rule_semiring);
             GrB_free(&rule_mult);
