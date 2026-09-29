@@ -626,15 +626,15 @@ static GrB_Info create_xor_runtime_blocked(const XorFamilyRouting *spec, CFL_Sym
     XorFamilyRoutingRuntime *rt = NULL;
  
 #undef FREE_INNER
-#define FREE_INNER()                                                                    \
-    {                                                                                   \
-        if (rt) {                                                                       \
-            LAGraph_Free((void **)&rt->resolved_S_operand, msg);                        \
-            LAGraph_Free((void **)&rt->resolved_S_target, msg);                         \
-            free(rt->resolved_p_ids);                                                   \
-            free(rt->masks);                                                            \
-            LAGraph_Free((void **)&rt, msg);                                            \
-        }                                                                               \
+#define FREE_INNER()                                                                     \
+    {                                                                                    \
+        if (rt) {                                                                        \
+            LAGraph_Free((void **)&rt->resolved_S_operand, msg);                         \
+            LAGraph_Free((void **)&rt->resolved_S_target, msg);                          \
+            free(rt->resolved_p_ids);                                                    \
+            free(rt->masks);                                                             \
+            LAGraph_Free((void **)&rt, msg);                                             \
+        }                                                                                \
     }
 
     TRY_INNER(LAGraph_Calloc((void **)&rt, 1, sizeof(XorFamilyRoutingRuntime), msg));
@@ -751,11 +751,30 @@ static GrB_Info get_new_rules(const LAGraph_rule_EWCNF *rules, size_t rules_coun
     return GrB_SUCCESS;
 }
 
+// Cache entry for memoizing unpacked or modulo-mapped P-operand matrices within a single
+// group evaluation pass.
 typedef struct {
     int32_t p_id;
     CFL_Matrix *p_base;
     bool occupied;
+    bool owned;
 } PIdCacheEntry;
+
+// Frees all owned matrices inside the P-operand cache and deallocates the table.
+static void p_cache_free(PIdCacheEntry **cache, size_t cap) {
+    if (*cache == NULL) {
+        return;
+    }
+
+    for (size_t i = 0; i < cap; i++) {
+        if ((*cache)[i].occupied && (*cache)[i].owned) {
+            CFL_matrix_free(&(*cache)[i].p_base);
+        }
+    }
+    free(*cache);
+    *cache = NULL;
+}
+
 
 // Returns the base matrix backing a P-operand, memoized per `p_id` in `cache`
 // (a simple open-addressed hash table local to one `xor_family_apply_phase_group` call).
@@ -769,6 +788,7 @@ static GrB_Info get_cached_p_base(int32_t p_id, bool is_blocked, CFL_Matrix *ope
     uint32_t hash = (uint32_t)p_id * magic_multiplier;
     size_t slot_idx = hash & (cache_capacity - 1);
 
+    // Look up p_id in open-addressed slot array
     while (cache[slot_idx].occupied) {
         if (cache[slot_idx].p_id == p_id) {
             *out_p_base = cache[slot_idx].p_base;
@@ -778,62 +798,75 @@ static GrB_Info get_cached_p_base(int32_t p_id, bool is_blocked, CFL_Matrix *ope
     }
 
     CFL_Matrix *p_base_cfl = NULL;
-    CFL_Matrix *op_base = NULL;
-    GrB_Index *rows = NULL;
-    GrB_Index *cols = NULL;
-    bool *vals = NULL;
+    CFL_Matrix *src_copy = NULL;
+    GrB_Index *rows = NULL, *cols = NULL;
+    GrB_Scalar one = NULL;
+    bool owned = true;
 
 #undef FREE_INNER
-#define FREE_INNER()                                                                    \
-    {                                                                                   \
-        free(rows);                                                                     \
-        free(cols);                                                                     \
-        free(vals);                                                                     \
-        CFL_matrix_free(&p_base_cfl);                                                   \
-        CFL_matrix_free(&op_base);                                                      \
+#define FREE_INNER()                                                                     \
+    {                                                                                    \
+        free(rows);                                                                      \
+        free(cols);                                                                      \
+        GrB_free(&one);                                                                  \
+        CFL_matrix_free(&src_copy);                                                      \
+        if (owned) CFL_matrix_free(&p_base_cfl);                                         \
     }
 
+    TRY_INNER(CFL_matrix_update(operand));
+
     if (is_blocked) {
-        TRY_INNER(CFL_matrix_to_base(&op_base, operand, optimizations));
+        // Project global coordinates modulo tile size n to construct the local blocked
+        // P-matrix
+        GrB_Matrix src = NULL;
+        if (operand->is_lazy) {
+            TRY_INNER(CFL_matrix_to_base(&src_copy, operand, optimizations));
+            src = src_copy->base;
+        } else {
+            src = operand->base;
+        }
+
         TRY_INNER(CFL_matrix_create(&p_base_cfl, n, n));
 
         GrB_Index nvals = 0;
-        TRY_INNER(GrB_Matrix_nvals(&nvals, op_base->base));
-
+        TRY_INNER(GrB_Matrix_nvals(&nvals, src));
         if (nvals > 0) {
             rows = (GrB_Index *)malloc(nvals * sizeof(GrB_Index));
             cols = (GrB_Index *)malloc(nvals * sizeof(GrB_Index));
-            vals = (bool *)malloc(nvals * sizeof(bool));
-
-            if (!rows || !cols || !vals) {
+            if (!rows || !cols) {
                 FREE_INNER();
                 return GrB_OUT_OF_MEMORY;
             }
 
-            TRY_INNER(GrB_Matrix_extractTuples_BOOL(rows, cols, vals, &nvals, op_base->base));
-
+            TRY_INNER(GrB_Matrix_extractTuples_BOOL(rows, cols, NULL, &nvals, src));
             for (GrB_Index k = 0; k < nvals; k++) {
                 rows[k] %= n;
                 cols[k] %= n;
             }
-
-            TRY_INNER(GrB_Matrix_build_BOOL(p_base_cfl->base, rows, cols, vals, nvals, GrB_LOR));
+            TRY_INNER(GrB_Scalar_new(&one, GrB_BOOL));
+            TRY_INNER(GrB_Scalar_setElement_BOOL(one, true));
+            TRY_INNER(GxB_Matrix_build_Scalar(p_base_cfl->base, rows, cols, one, nvals));
 
             free(rows);
             free(cols);
-            free(vals);
             rows = NULL;
             cols = NULL;
-            vals = NULL;
+            TRY_INNER(GrB_free(&one));
+            TRY_INNER(CFL_matrix_update(p_base_cfl));
         }
 
-        TRY_INNER(CFL_matrix_free(&op_base));
+        TRY_INNER(CFL_matrix_free(&src_copy));
+    } else if (!operand->is_lazy && !(optimizations & OPT_FORMAT)) {
+        // Direct reference borrow when non-lazy and format conversion is off
+        p_base_cfl = operand;
+        owned = false;
     } else {
         TRY_INNER(CFL_matrix_to_base(&p_base_cfl, operand, optimizations));
     }
 
     cache[slot_idx].p_id = p_id;
     cache[slot_idx].p_base = p_base_cfl;
+    cache[slot_idx].owned = owned;
     cache[slot_idx].occupied = true;
 
     *out_p_base = p_base_cfl;
@@ -848,14 +881,22 @@ static GrB_Info get_cached_p_base(int32_t p_id, bool is_blocked, CFL_Matrix *ope
 // S_operand/S_target family. Handling them mask by mask turns what would otherwise be
 // one matrix multiply per (mask, P, family member) triple into one multiply per distinct
 // mask, covering all N family members at once:
-//   1. OR together every P-operand that shares a given mask.
-//   2. Concatenate the N S_operand tiles side by side, but permuted so that column-block
-//      m holds the tile for member (m XOR mask) — this is what lines up "family member
-//      m" with "the operand it actually needs" for that mask, in a single wide matrix.
-//   3. One multiply per mask against that permutation, accumulated across masks, gives
-//      every family member's update in one pass.
-//   4. Split the wide result back into per-member tiles and OR each into
-//      temp_matrices[S_target[m]], same as an ordinary rule's output.
+//   1. Early exit: Check if any delta inputs exist before allocating local state.
+//   2. Borrow S_operand tiles directly into `S_tiles` without copying if they are
+//      non-lazy.
+//   3. Streamlined per-mask evaluation:
+//      a. Reduce P-operands belonging to mask `im`. If a mask contains a single term,
+//         borrow its cached matrix pointer directly without allocation or CFL_wise
+//         calls.
+//      b. Concatenate the N S_operand tiles side by side, permuted so column-block m
+//         holds tile (m XOR mask) — lining up family member m with its required operand.
+//      c. Execute one wide multiply per mask against that permutation, accumulating into
+//         Result_wide_cfl, and immediately free per-mask temporary matrices.
+//   4. Direct split: Slice Result_wide_cfl directly into Result_tiles without invoking
+//      Result_wide_eval.
+//   5. Output write-back: Move tiles to temp_matrices[S_target[m]]. If the target tile is
+//      currently empty and non-lazy, transfer matrix ownership directly to bypass
+//      CFL_wise.
 GrB_Info xor_family_apply_phase_group(XorFamilyGroup *group, bool phase2,
                                       CFL_Matrix **matrices, CFL_Matrix **delta_matrices,
                                       CFL_Matrix **temp_matrices, int8_t optimizations) {
@@ -865,13 +906,11 @@ GrB_Info xor_family_apply_phase_group(XorFamilyGroup *group, bool phase2,
 
     GrB_Matrix S_tiles[N];
     CFL_Matrix *s_cfl[N];
-    CFL_Matrix *reduced_by_im[N];
     GrB_Matrix Result_tiles[N];
 
-  for (int64_t i = 0; i < N; i++) {
+    for (int64_t i = 0; i < N; i++) {
         S_tiles[i] = NULL;
         s_cfl[i] = NULL;
-        reduced_by_im[i] = NULL;
         Result_tiles[i] = NULL;
     }
 
@@ -879,146 +918,204 @@ GrB_Info xor_family_apply_phase_group(XorFamilyGroup *group, bool phase2,
     size_t cache_capacity = 0;
     CFL_Matrix *Result_wide_cfl = NULL;
     CFL_Matrix *S_wide_perm = NULL;
-    CFL_Matrix *Result_wide_eval = NULL;
     CFL_Matrix *piece = NULL;
+    CFL_Matrix *reduced = NULL;
+    CFL_Matrix *sum = NULL;
+    bool reduced_owned = false;
 
 #undef FREE_INNER
-#define FREE_INNER()                                                                    \
-    {                                                                                   \
-        CFL_matrix_free(&piece);                                                        \
-        CFL_matrix_free(&Result_wide_eval);                                             \
-        CFL_matrix_free(&Result_wide_cfl);                                              \
-        CFL_matrix_free(&S_wide_perm);                                                  \
-        for (int64_t i = 0; i < N; i++) {                                               \
-            CFL_matrix_free(&s_cfl[i]);                                                 \
-            CFL_matrix_free(&reduced_by_im[i]);                                         \
-            if (Result_tiles[i] != NULL) {                                              \
-                GrB_free(&Result_tiles[i]);                                             \
-            }                                                                           \
-        }                                                                               \
-        if (p_cache != NULL) {                                                          \
-            for (size_t i = 0; i < cache_capacity; i++) {                               \
-                if (p_cache[i].occupied && p_cache[i].p_base != NULL) {                 \
-                    CFL_matrix_free(&p_cache[i].p_base);                                \
-                }                                                                       \
-            }                                                                           \
-            free(p_cache);                                                              \
-        }                                                                               \
+#define FREE_INNER()                                                                     \
+    {                                                                                    \
+        CFL_matrix_free(&piece);                                                         \
+        CFL_matrix_free(&sum);                                                           \
+        if (reduced_owned) CFL_matrix_free(&reduced);                                    \
+        CFL_matrix_free(&S_wide_perm);                                                   \
+        CFL_matrix_free(&Result_wide_cfl);                                               \
+        for (int64_t i = 0; i < N; i++) {                                                \
+            CFL_matrix_free(&s_cfl[i]);                                                  \
+            if (Result_tiles[i] != NULL) GrB_free(&Result_tiles[i]);                     \
+        }                                                                                \
+        p_cache_free(&p_cache, cache_capacity);                                          \
     }
 
-    // Gather the base matrix of every S_operand family member once; these are reused,
-    // permuted by mask, for every distinct `im` below.
-    for (size_t m = 0; m < N; m++) {
-        int32_t s_id = is_blocked ? group->resolved_S_operand[m]
+    // 1. Early exit check: Skip execution if no delta matrices contain nonzeros
+    bool has_work = false;
+    if (!phase2) {
+        for (int64_t m = 0; m < N && !has_work; m++) {
+            int32_t s_id = is_blocked 
+                               ? group->resolved_S_operand[m]
                                : group->S_operand_base + (int32_t)(m * group->S_stride);
-        CFL_Matrix *operand = phase2 ? matrices[s_id] : delta_matrices[s_id];
-
-        TRY_INNER(CFL_matrix_to_base(&s_cfl[m], operand, optimizations));
-        S_tiles[m] = s_cfl[m]->base;
+            TRY_INNER(CFL_matrix_update(delta_matrices[s_id]));
+            has_work = delta_matrices[s_id]->nvals > 0;
+        }
+    } else {
+        for (int64_t k = 0; k < group->total_count && !has_work; k++) {
+            int32_t p_id = is_blocked ? group->resolved_p_ids[k] : group->p_ids[k];
+            TRY_INNER(CFL_matrix_update(delta_matrices[p_id]));
+            has_work = delta_matrices[p_id]->nvals > 0;
+        }
+    }
+    if (!has_work) {
+        return GrB_SUCCESS;
     }
 
-    GrB_Index n = s_cfl[0]->ncols;
+    // 2. Gather S_operand tiles once. Non-lazy operands are aliased directly without
+    // copies.
+    for (size_t m = 0; m < N; m++) {
+        int32_t s_id = is_blocked
+                           ? group->resolved_S_operand[m]
+                           : group->S_operand_base + (int32_t)(m * group->S_stride);
+        CFL_Matrix *operand = phase2 ? matrices[s_id] : delta_matrices[s_id];
+        TRY_INNER(CFL_matrix_update(operand));
+        if (!operand->is_lazy) {
+            S_tiles[m] = operand->base;
+        } else {
+            TRY_INNER(CFL_matrix_to_base(&s_cfl[m], operand, optimizations));
+            S_tiles[m] = s_cfl[m]->base;
+        }
+    }
 
+    GrB_Index n;
+    TRY_INNER(GrB_Matrix_ncols(&n, S_tiles[0]));
+
+    // Early exit if all gathered S_tiles are empty
+    bool any_S = false;
+    for (int64_t m = 0; m < N && !any_S; m++) {
+        GrB_Index nv;
+        TRY_INNER(GrB_Matrix_nvals(&nv, S_tiles[m]));
+        any_S = nv > 0;
+    }
+    if (!any_S) {
+        FREE_INNER();
+        return GrB_SUCCESS;
+    }
+
+    // Allocate P-operand memoization cache
     cache_capacity = 16;
     while (cache_capacity < (size_t)group->total_count * 2) {
         cache_capacity *= 2;
     }
     p_cache = (PIdCacheEntry *)calloc(cache_capacity, sizeof(PIdCacheEntry));
     if (!p_cache) {
-        for (size_t m = 0; m < N; m++)
-            CFL_matrix_free(&s_cfl[m]);
+        FREE_INNER();
         return GrB_OUT_OF_MEMORY;
     }
 
-    // Reduce every (mask, P-operand) term of the group down to one matrix per distinct
-    // mask: reduced_by_im[im] = OR of P[p]'s base matrix over every term that shares
-    // mask `im`. This is what lets all N family members be updated together per mask,
-    // instead of once per term.
-    for (int64_t idx = 0; idx < group->total_count; idx++) {
-        int64_t im = group->active_masks[idx];
-        int32_t p_id = is_blocked ? group->resolved_p_ids[idx] : group->p_ids[idx];
-
-        CFL_Matrix *operand = phase2 ? delta_matrices[p_id] : matrices[p_id];
-        CFL_Matrix *p_base_cfl = NULL;
-
-        TRY_INNER(get_cached_p_base(p_id, is_blocked, operand, n, optimizations, p_cache,
-                                  cache_capacity, &p_base_cfl));
-
-        if (reduced_by_im[im] == NULL) {
-            TRY_INNER(CFL_matrix_create(&reduced_by_im[im], n, n));
-            TRY_INNER(CFL_dup(reduced_by_im[im], p_base_cfl, optimizations));
-        } else {
-            TRY_INNER(CFL_wise(reduced_by_im[im], reduced_by_im[im], p_base_cfl, true,
-                             optimizations));
-        }
-    }
-
-    for (size_t i = 0; i < cache_capacity; i++) {
-        if (p_cache[i].occupied && p_cache[i].p_base != NULL) {
-            TRY_INNER(CFL_matrix_free(&p_cache[i].p_base));
-        }
-    }
-    free(p_cache);
-
     TRY_INNER(CFL_matrix_create(&Result_wide_cfl, n, N * n));
 
-    // For every mask that actually occurs, multiply its reduced P-operand by all N
-    // operand tiles at once, permuted so that slot `m` holds S_operand[m ^ im] — this is
-    // the concat/mxm/split trick that implements
-    // "S_target[m] |= P[im] . S_operand[m ^ im] for every m" as a single wide
-    // multiplication instead of N separate ones.
+    // 3. Streamlined per-mask evaluation loop
     for (int64_t im = 0; im < N; im++) {
-        if (reduced_by_im[im] == NULL) {
+        for (size_t idx = 0; idx < group->total_count; idx++) {
+            if (group->active_masks[idx] != im) {
+                continue;
+            }
+
+            int32_t p_id = is_blocked ? group->resolved_p_ids[idx] : group->p_ids[idx];
+            CFL_Matrix *operand = phase2 ? delta_matrices[p_id] : matrices[p_id];
+            TRY_INNER(CFL_matrix_update(operand));
+            if (phase2 && operand->nvals == 0) {
+                continue;
+            }
+
+            CFL_Matrix *p_base = NULL;
+            TRY_INNER(get_cached_p_base(p_id, is_blocked, operand, n, optimizations,
+                                        p_cache, cache_capacity, &p_base));
+            if (reduced == NULL) {
+                // Borrow reference directly for single-term masks (bypasses CFL_wise)
+                reduced = p_base;
+                reduced_owned = false;
+            } else if (!reduced_owned) {
+                // First reduction step: allocate local sum matrix
+                TRY_INNER(CFL_matrix_create(&sum, n, n));
+                TRY_INNER(CFL_wise(sum, reduced, p_base, false, optimizations));
+                reduced = sum;
+                sum = NULL;
+                reduced_owned = true;
+            } else {
+                // Accumulate subsequent terms in-place
+                TRY_INNER(CFL_wise(reduced, reduced, p_base, true, optimizations));
+            }
+        }
+
+        if (reduced == NULL) {
             continue;
         }
+        TRY_INNER(CFL_matrix_update(reduced));
 
-        GrB_Matrix S_perm_tiles[N];
-        for (size_t m = 0; m < N; m++) {
-            S_perm_tiles[m] = S_tiles[m ^ im];
+        // Multiply reduced P-operand against permuted S-tiles for current mask
+        if (reduced->nvals > 0) {
+            GrB_Matrix S_perm_tiles[N];
+            for (int64_t m = 0; m < N; m++) {
+                S_perm_tiles[m] = S_tiles[m ^ im];
+            }
+
+            TRY_INNER(CFL_matrix_create(&S_wide_perm, n, N * n));
+            TRY_INNER(GxB_Matrix_concat(
+                S_wide_perm->base, S_perm_tiles, 1, N, GrB_NULL
+            ));
+            TRY_INNER(CFL_matrix_update(S_wide_perm));
+            TRY_INNER(CFL_mxm(Result_wide_cfl, reduced, S_wide_perm, true, false,
+                              optimizations));
+            TRY_INNER(CFL_matrix_free(&S_wide_perm));
         }
 
-        TRY_INNER(CFL_matrix_create(&S_wide_perm, n, N * n));
-        TRY_INNER(GxB_Matrix_concat(S_wide_perm->base, S_perm_tiles, 1, N, GrB_NULL));
-        TRY_INNER(CFL_matrix_update(S_wide_perm));
-
-        TRY_INNER(CFL_mxm(Result_wide_cfl, reduced_by_im[im], S_wide_perm, true, false,
-                        optimizations));
-
-        TRY_INNER(CFL_matrix_free(&S_wide_perm));
-        TRY_INNER(CFL_matrix_free(&reduced_by_im[im]));
+        if (reduced_owned) {
+            TRY_INNER(CFL_matrix_free(&reduced));
+        }
+        reduced = NULL;
+        reduced_owned = false;
     }
 
-    for (size_t m = 0; m < N; m++) {
-        TRY_INNER(CFL_matrix_free(&s_cfl[m]));
+    p_cache_free(&p_cache, cache_capacity);
+
+    // Early exit if result matrix accumulated no structural nonzeros
+    TRY_INNER(CFL_matrix_update(Result_wide_cfl));
+    if (Result_wide_cfl->nvals == 0) {
+        FREE_INNER();
+        return GrB_SUCCESS;
     }
 
-    TRY_INNER(CFL_matrix_to_base(&Result_wide_eval, Result_wide_cfl, optimizations));
-
+    // 4. Split wide result directly into per-member tiles and release wide buffer
+    // immediately
     GrB_Index rows_arr[1] = {n};
     GrB_Index cols_arr[N];
-
     for (size_t i = 0; i < N; i++) {
         cols_arr[i] = n;
     }
 
     TRY_INNER(GxB_Matrix_split(Result_tiles, 1, N, rows_arr, cols_arr,
-                             Result_wide_eval->base, GrB_NULL));
-
+                               Result_wide_cfl->base, GrB_NULL));
     TRY_INNER(CFL_matrix_free(&Result_wide_cfl));
-    TRY_INNER(CFL_matrix_free(&Result_wide_eval));
 
+    // 5. Write back to temp_matrices[S_target[m]]. Direct pointer swap if target is
+    // empty
     for (size_t m = 0; m < N; m++) {
-        int32_t s_target_id = is_blocked
-                                  ? group->resolved_S_target[m]
+        int32_t t_id = is_blocked ? group->resolved_S_target[m]
                                   : group->S_target_base + (int32_t)(m * group->S_stride);
+
         TRY_INNER(CFL_matrix_from_base(&piece, Result_tiles[m]));
+        Result_tiles[m] = NULL; // Transfer tile ownership to `piece`
 
-        TRY_INNER(CFL_wise(temp_matrices[s_target_id], temp_matrices[s_target_id], piece,
-                         true, optimizations));
+        if (piece->nvals == 0) {
+            TRY_INNER(CFL_matrix_free(&piece));
+            continue;
+        }
 
-        TRY_INNER(CFL_matrix_free(&piece));
+        CFL_Matrix *dst = temp_matrices[t_id];
+        TRY_INNER(CFL_matrix_update(dst));
+        if (dst->nvals == 0 && !dst->is_lazy && dst->nrows == n && dst->ncols == n) {
+            // Zero-copy ownership transfer into empty target
+            TRY_INNER(CFL_matrix_free(&temp_matrices[t_id]));
+            temp_matrices[t_id] = piece;
+            piece = NULL;
+        } else {
+            // Standard in-place union fallback
+            TRY_INNER(CFL_wise(dst, dst, piece, true, optimizations));
+            TRY_INNER(CFL_matrix_free(&piece));
+        }
     }
 
+    FREE_INNER();
     return GrB_SUCCESS;
 }
 
