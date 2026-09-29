@@ -878,24 +878,22 @@ static GrB_Info get_cached_p_base(int32_t p_id, bool is_blocked, CFL_Matrix *ope
 // ordinary per-rule CFL_mxm calls elsewhere in the main loop use).
 //
 // A group bundles several (mask, P-operand) terms that all feed the same
-// S_operand/S_target family. Handling them mask by mask turns what would otherwise be
-// one matrix multiply per (mask, P, family member) triple into one multiply per distinct
-// mask, covering all N family members at once:
+// S_operand/S_target family. Handling all masks simultaneously turns what would
+// otherwise be N separate matrix multiplies into a single global matrix multiplication
+// across all N masks and all N family members at once:
 //   1. Early exit: Check if any delta inputs exist before allocating local state.
-//   2. Borrow S_operand tiles directly into `S_tiles` without copying if they are
-//      non-lazy.
-//   3. Streamlined per-mask evaluation:
-//      a. Reduce P-operands belonging to mask `im`. If a mask contains a single term,
-//         borrow its cached matrix pointer directly without allocation or CFL_wise
-//         calls.
-//      b. Concatenate the N S_operand tiles side by side, permuted so column-block m
-//         holds tile (m XOR mask) — lining up family member m with its required operand.
-//      c. Execute one wide multiply per mask against that permutation, accumulating into
-//         Result_wide_cfl, and immediately free per-mask temporary matrices.
-//   4. Direct split: Slice Result_wide_cfl directly into Result_tiles without invoking
-//      Result_wide_eval.
-//   5. Output write-back: Move tiles to temp_matrices[S_target[m]]. If the target tile is
-//      currently empty and non-lazy, transfer matrix ownership directly to bypass
+//   2. Borrow S_operand tiles directly into `S_tiles` without copying if non-lazy.
+//   3. Reduce P-operands per mask: Precompute `reduced_p[im]` for all masks `im` in
+//      advance.
+//   4. Construct super-matrices:
+//      a. Concatenate all `reduced_p[im]` tiles horizontally into `P_wide_cfl` (n x N*n).
+//      b. Build `S_big_cfl` (N*n x N*n) as an N x N block grid where tile (im, m)
+//         holds `S_tiles[im XOR m]`.
+//   5. Single matrix multiplication: Perform one wide multiplication
+//      `Result_wide = P_wide * S_big` covering all masks simultaneously.
+//   6. Direct split: Slice Result_wide_cfl directly into Result_tiles.
+//   7. Output write-back: Move tiles to temp_matrices[S_target[m]]. If the target tile
+//      is currently empty and non-lazy, transfer matrix ownership directly to bypass
 //      CFL_wise.
 GrB_Info xor_family_apply_phase_group(XorFamilyGroup *group, bool phase2,
                                       CFL_Matrix **matrices, CFL_Matrix **delta_matrices,
@@ -907,31 +905,35 @@ GrB_Info xor_family_apply_phase_group(XorFamilyGroup *group, bool phase2,
     GrB_Matrix S_tiles[N];
     CFL_Matrix *s_cfl[N];
     GrB_Matrix Result_tiles[N];
+    CFL_Matrix *reduced_p[N];
+    bool reduced_p_owned[N];
 
     for (int64_t i = 0; i < N; i++) {
         S_tiles[i] = NULL;
         s_cfl[i] = NULL;
         Result_tiles[i] = NULL;
+        reduced_p[i] = NULL;
+        reduced_p_owned[i] = false;
     }
 
     PIdCacheEntry *p_cache = NULL;
     size_t cache_capacity = 0;
     CFL_Matrix *Result_wide_cfl = NULL;
-    CFL_Matrix *S_wide_perm = NULL;
+    CFL_Matrix *P_wide_cfl = NULL;
+    CFL_Matrix *S_big_cfl = NULL;
+    GrB_Matrix empty_p_tile = NULL;
     CFL_Matrix *piece = NULL;
-    CFL_Matrix *reduced = NULL;
-    CFL_Matrix *sum = NULL;
-    bool reduced_owned = false;
 
 #undef FREE_INNER
 #define FREE_INNER()                                                                     \
     {                                                                                    \
         CFL_matrix_free(&piece);                                                         \
-        CFL_matrix_free(&sum);                                                           \
-        if (reduced_owned) CFL_matrix_free(&reduced);                                    \
-        CFL_matrix_free(&S_wide_perm);                                                   \
+        if (empty_p_tile != NULL) GrB_free(&empty_p_tile);                               \
+        CFL_matrix_free(&S_big_cfl);                                                     \
+        CFL_matrix_free(&P_wide_cfl);                                                    \
         CFL_matrix_free(&Result_wide_cfl);                                               \
         for (int64_t i = 0; i < N; i++) {                                                \
+            if (reduced_p_owned[i]) CFL_matrix_free(&reduced_p[i]);                      \
             CFL_matrix_free(&s_cfl[i]);                                                  \
             if (Result_tiles[i] != NULL) GrB_free(&Result_tiles[i]);                     \
         }                                                                                \
@@ -960,7 +962,7 @@ GrB_Info xor_family_apply_phase_group(XorFamilyGroup *group, bool phase2,
     }
 
     // 2. Gather S_operand tiles once. Non-lazy operands are aliased directly without
-    // copies.
+    // copies
     for (size_t m = 0; m < N; m++) {
         int32_t s_id = is_blocked
                            ? group->resolved_S_operand[m]
@@ -1001,9 +1003,7 @@ GrB_Info xor_family_apply_phase_group(XorFamilyGroup *group, bool phase2,
         return GrB_OUT_OF_MEMORY;
     }
 
-    TRY_INNER(CFL_matrix_create(&Result_wide_cfl, n, N * n));
-
-    // 3. Streamlined per-mask evaluation loop
+    // 3. Reduce P-operands per mask im
     for (int64_t im = 0; im < N; im++) {
         for (size_t idx = 0; idx < group->total_count; idx++) {
             if (group->active_masks[idx] != im) {
@@ -1020,53 +1020,88 @@ GrB_Info xor_family_apply_phase_group(XorFamilyGroup *group, bool phase2,
             CFL_Matrix *p_base = NULL;
             TRY_INNER(get_cached_p_base(p_id, is_blocked, operand, n, optimizations,
                                         p_cache, cache_capacity, &p_base));
-            if (reduced == NULL) {
+            if (reduced_p[im] == NULL) {
                 // Borrow reference directly for single-term masks (bypasses CFL_wise)
-                reduced = p_base;
-                reduced_owned = false;
-            } else if (!reduced_owned) {
+                reduced_p[im] = p_base;
+                reduced_p_owned[im] = false;
+            } else if (!reduced_p_owned[im]) {
                 // First reduction step: allocate local sum matrix
+                CFL_Matrix *sum = NULL;
                 TRY_INNER(CFL_matrix_create(&sum, n, n));
-                TRY_INNER(CFL_wise(sum, reduced, p_base, false, optimizations));
-                reduced = sum;
-                sum = NULL;
-                reduced_owned = true;
+                TRY_INNER(CFL_wise(sum, reduced_p[im], p_base, false, optimizations));
+                reduced_p[im] = sum;
+                reduced_p_owned[im] = true;
             } else {
                 // Accumulate subsequent terms in-place
-                TRY_INNER(CFL_wise(reduced, reduced, p_base, true, optimizations));
+                TRY_INNER(CFL_wise(reduced_p[im], reduced_p[im], p_base, true, optimizations));
             }
         }
-
-        if (reduced == NULL) {
-            continue;
-        }
-        TRY_INNER(CFL_matrix_update(reduced));
-
-        // Multiply reduced P-operand against permuted S-tiles for current mask
-        if (reduced->nvals > 0) {
-            GrB_Matrix S_perm_tiles[N];
-            for (int64_t m = 0; m < N; m++) {
-                S_perm_tiles[m] = S_tiles[m ^ im];
-            }
-
-            TRY_INNER(CFL_matrix_create(&S_wide_perm, n, N * n));
-            TRY_INNER(GxB_Matrix_concat(
-                S_wide_perm->base, S_perm_tiles, 1, N, GrB_NULL
-            ));
-            TRY_INNER(CFL_matrix_update(S_wide_perm));
-            TRY_INNER(CFL_mxm(Result_wide_cfl, reduced, S_wide_perm, true, false,
-                              optimizations));
-            TRY_INNER(CFL_matrix_free(&S_wide_perm));
-        }
-
-        if (reduced_owned) {
-            TRY_INNER(CFL_matrix_free(&reduced));
-        }
-        reduced = NULL;
-        reduced_owned = false;
     }
 
+    // Early exit if all reduced P-operands are empty
+    bool any_P = false;
+    for (int64_t im = 0; im < N; im++) {
+        if (reduced_p[im] != NULL) {
+            TRY_INNER(CFL_matrix_update(reduced_p[im]));
+            if (reduced_p[im]->nvals > 0) {
+                any_P = true;
+            }
+        }
+    }
+
+    if (!any_P) {
+        FREE_INNER();
+        return GrB_SUCCESS;
+    }
+
+    // 4. Construct P_wide matrix (n x N*n)
+    GrB_Matrix P_wide_tiles[N];
+    for (int64_t im = 0; im < N; im++) {
+        if (reduced_p[im] != NULL && reduced_p[im]->nvals > 0) {
+            P_wide_tiles[im] = reduced_p[im]->base;
+        } else {
+            if (empty_p_tile == NULL) {
+                TRY_INNER(GrB_Matrix_new(&empty_p_tile, GrB_BOOL, n, n));
+            }
+            P_wide_tiles[im] = empty_p_tile;
+        }
+    }
+
+    TRY_INNER(CFL_matrix_create(&P_wide_cfl, n, N * n));
+    TRY_INNER(GxB_Matrix_concat(P_wide_cfl->base, P_wide_tiles, 1, N, GrB_NULL));
+    TRY_INNER(CFL_matrix_update(P_wide_cfl));
+
+    // Construct S_big matrix (N*n x N*n)
+    GrB_Matrix S_big_tiles[N * N];
+    for (int64_t im = 0; im < N; im++) {
+        for (int64_t m = 0; m < N; m++) {
+            S_big_tiles[im * N + m] = S_tiles[im ^ m];
+        }
+    }
+
+    TRY_INNER(CFL_matrix_create(&S_big_cfl, N * n, N * n));
+    TRY_INNER(GxB_Matrix_concat(S_big_cfl->base, S_big_tiles, N, N, GrB_NULL));
+    TRY_INNER(CFL_matrix_update(S_big_cfl));
+
+    // 5. Single matrix multiplication for all masks
+    TRY_INNER(CFL_matrix_create(&Result_wide_cfl, n, N * n));
+    TRY_INNER(CFL_mxm(Result_wide_cfl, P_wide_cfl, S_big_cfl, true, false, optimizations));
+
+    // Release intermediate P-cache and big matrices before write-back
     p_cache_free(&p_cache, cache_capacity);
+    if (empty_p_tile != NULL) {
+        GrB_free(&empty_p_tile);
+        empty_p_tile = NULL;
+    }
+    CFL_matrix_free(&P_wide_cfl);
+    CFL_matrix_free(&S_big_cfl);
+    for (int64_t im = 0; im < N; im++) {
+        if (reduced_p_owned[im]) {
+            CFL_matrix_free(&reduced_p[im]);
+        }
+        reduced_p[im] = NULL;
+        reduced_p_owned[im] = false;
+    }
 
     // Early exit if result matrix accumulated no structural nonzeros
     TRY_INNER(CFL_matrix_update(Result_wide_cfl));
@@ -1075,8 +1110,7 @@ GrB_Info xor_family_apply_phase_group(XorFamilyGroup *group, bool phase2,
         return GrB_SUCCESS;
     }
 
-    // 4. Split wide result directly into per-member tiles and release wide buffer
-    // immediately
+    // 6. Split wide result directly into per-member tiles
     GrB_Index rows_arr[1] = {n};
     GrB_Index cols_arr[N];
     for (size_t i = 0; i < N; i++) {
@@ -1087,8 +1121,7 @@ GrB_Info xor_family_apply_phase_group(XorFamilyGroup *group, bool phase2,
                                Result_wide_cfl->base, GrB_NULL));
     TRY_INNER(CFL_matrix_free(&Result_wide_cfl));
 
-    // 5. Write back to temp_matrices[S_target[m]]. Direct pointer swap if target is
-    // empty
+    // 7. Write back to temp_matrices[S_target[m]]
     for (size_t m = 0; m < N; m++) {
         int32_t t_id = is_blocked ? group->resolved_S_target[m]
                                   : group->S_target_base + (int32_t)(m * group->S_stride);
@@ -1118,7 +1151,6 @@ GrB_Info xor_family_apply_phase_group(XorFamilyGroup *group, bool phase2,
     FREE_INNER();
     return GrB_SUCCESS;
 }
-
 
 // LAGraph_CFL_reachability_adv: Context-Free Language Reachability Matrix-Based
 // Algorithm
