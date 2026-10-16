@@ -17,9 +17,8 @@
 // Algorithm" and based on the python implementation from:
 // https://github.com/FormalLanguageConstrainedPathQuerying/CFPQ_PyAlgo/tree/murav/optimize-matrix
 
-#include "LAGraph_CFL_optimized_matrix_opt.h"
+#include "LAGraph_CFL_pattern.h"
 #include "LG_internal.h"
-#include <LAGraphX.h>
 
 #define BENCH_CFL_REACHBILITY false
 
@@ -85,6 +84,7 @@
 #define OPT_FORMAT (1 << 1)
 #define OPT_LAZY (1 << 2)
 #define OPT_BLOCK (1 << 3)
+#define OPT_PAT (1 << 4)
 
 typedef CFL_Matrix Matrix;
 typedef enum CFL_Matrix_block Matrix_block;
@@ -633,6 +633,11 @@ GrB_Info CFL_matrix_from_base(Matrix **matrix, GrB_Matrix base) {
     // Block optimization fields
     result->block_type = CELL;
 
+    // Grammar pattern optimization
+    result->pat_cache = NULL;
+    result->pat_cache_key = NULL;
+    result->pat_cache_nvals = 0;
+
     TRY(CFL_matrix_update(result));
     *matrix = result;
 
@@ -686,6 +691,11 @@ GrB_Info CFL_matrix_free(Matrix **matrix_p) {
     }
 
     Matrix *matrix = *matrix_p;
+
+    if (matrix->pat_cache != NULL) {
+        GrB_Matrix_free(&(matrix->pat_cache));
+    }
+
     if (matrix->is_both) {
         TRY(GrB_Matrix_free(&(matrix->base_col)));
         TRY(GrB_Matrix_free(&(matrix->base_row)));
@@ -841,7 +851,14 @@ GrB_Info matrix_wise_block(Matrix *output, Matrix *first, Matrix *second, bool a
                            int8_t optimizations);
 
 GrB_Info matrix_mxm_block(Matrix *output, Matrix *first, Matrix *second, bool accum,
-                          bool swap, int8_t optimizations) {
+                          bool swap, int8_t optimizations, const LAGraph_rule_Pat *pat,
+                          const Pat_Context *ctx) {
+
+    if ((optimizations & OPT_PAT) && pat != NULL) {
+        TRY(CFL_Pat_matrix_mxm(output, first, second, accum, swap, optimizations, pat, ctx));
+        return GrB_SUCCESS;
+    }
+
     if (!(optimizations & OPT_BLOCK)) {
         TRY(matrix_mxm_lazy(output, first, second, accum, swap, optimizations));
         return GrB_SUCCESS;
@@ -1284,12 +1301,12 @@ GrB_Info matrix_rsub_block(Matrix *output, Matrix *mask, int8_t optimizations) {
 // order of optimizations: block -> lazy -> empty -> format
 
 GrB_Info CFL_mxm(Matrix *output, Matrix *first, Matrix *second, bool accum, bool swap,
-                 int8_t optimizations) {
+                 int8_t optimizations, const LAGraph_rule_Pat *pat, const Pat_Context *ctx) {
     TRY(CFL_matrix_update(first));
     TRY(CFL_matrix_update(second));
     TRY(CFL_matrix_update(output));
 
-    TRY(matrix_mxm_block(output, first, second, accum, swap, optimizations));
+    TRY(matrix_mxm_block(output, first, second, accum, swap, optimizations, pat, ctx));
 
     TRY(CFL_matrix_update(output));
     return GrB_SUCCESS;

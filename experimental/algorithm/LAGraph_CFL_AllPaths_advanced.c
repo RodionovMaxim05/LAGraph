@@ -66,6 +66,37 @@ static void set_all_paths(AllPathsElem *z, const AllPathsElem *x,
     "  z->n = 1; \n"                                                                     \
     "}"
 
+// Helper function to execute a concrete binary rule for pattern optimization (OPT_PAT).
+#define EXECUTE_CONCRETE_RULE(cur_A, cur_pA, cur_pB)                                     \
+    do {                                                                                 \
+        if (!t_empty_flags[(cur_pA)] && !t_empty_flags[(cur_pB)]) {                      \
+            int32_t this_rule_id = (int32_t)rule_table_count;                            \
+            LG_TRY(rule_table_push(&rule_table, &rule_table_count, &rule_table_cap,      \
+                                    (cur_A), (cur_pA), (cur_pB)));                       \
+            GRB_TRY(GrB_Scalar_setElement_INT32(rule_theta, this_rule_id));              \
+            GrB_BinaryOp rule_mult;                                                      \
+            GRB_TRY(GxB_BinaryOp_new_IndexOp(&rule_mult, IAllPaths_mult, rule_theta));   \
+            GrB_Semiring rule_semiring;                                                  \
+            GRB_TRY(GrB_Semiring_new(&rule_semiring, AllPaths_monoid, rule_mult));       \
+            GrB_BinaryOp acc_op = t_empty_flags[(cur_A)] ? GrB_NULL : AllPaths_add;      \
+            GRB_TRY(GrB_mxm(T[(cur_A)], outputs_reachability[(cur_A)],                   \
+                            acc_op, rule_semiring, outputs_reachability[(cur_pA)],       \
+                            outputs_reachability[(cur_pB)], desc_s));                    \
+            GrB_free(&rule_semiring);                                                    \
+            GrB_free(&rule_mult);                                                        \
+            t_empty_flags[(cur_A)] = false;                                              \
+        }                                                                                \
+    } while (0)
+
+static inline int32_t pat_role_id(const LAGraph_Pat_role *role, int64_t mask,
+                                 int64_t qr, int64_t qc, int64_t i) {
+    if (role->kind == LAGraph_PAT_SYM_PLAIN) {
+        return role->base + (int32_t)i;
+    }
+    return role->base + (int32_t)(mask * role->mask_stride + qr * role->qrow_stride +
+                                 qc * role->qcol_stride + i);
+}
+
 GrB_Info LAGraph_CFL_AllPaths_adv(GrB_Matrix *outputs, GrB_Type *all_paths_ptr_t,
                                   BinaryRuleInfo **out_rule_table,
                                   const GrB_Matrix *adj_matrices, size_t symbols_amount,
@@ -261,77 +292,111 @@ GrB_Info LAGraph_CFL_AllPaths_adv(GrB_Matrix *outputs, GrB_Type *all_paths_ptr_t
     for (size_t i = 0; i < bin_rules_count; i++) {
         LAGraph_rule_EWCNF bin_rule = new_rules[bin_rules[i]];
 
-        if (bin_rule.xor_routing != NULL) {
-            // Handle rules using xor_routing optimization family
+        // OPT_PAT: Handling indexed pattern rules (CONV, SCALE, LEFT, RIGHT)
+        const LAGraph_rule_Pat *pat = bin_rule.pat;
 
-            XorFamilyRouting *rt = bin_rule.xor_routing;
+        if (pat != NULL && pat->kind == LAGraph_PAT_CONV) {
+            int64_t N = pat->masks, R = pat->states, K = pat->idx_count;
 
-            for (int64_t idx_m = 0; idx_m < rt->active_masks_count; idx_m++) {
-                int64_t im = rt->active_masks[idx_m];
-                int32_t p_id = rt->p_ids[idx_m];
-
-                for (int64_t m = 0; m < rt->N; m++) {
-                    int64_t next = m ^ im;
-                    int32_t cur_A = rt->S_target_base + (int32_t)(m * rt->S_stride);
-                    int32_t cur_pA = p_id;
-                    int32_t cur_pB = rt->S_operand_base + (int32_t)(next * rt->S_stride);
-
-                    if (t_empty_flags[cur_pA] || t_empty_flags[cur_pB])
-                        continue;
-
-                    int32_t this_rule_id = (int32_t)rule_table_count;
-                    LG_TRY(rule_table_push(&rule_table, &rule_table_count,
-                                           &rule_table_cap, cur_A, cur_pA, cur_pB));
-
-                    GRB_TRY(GrB_Scalar_setElement_INT32(rule_theta, this_rule_id));
-
-                    GrB_BinaryOp rule_mult;
-                    GRB_TRY(
-                        GxB_BinaryOp_new_IndexOp(&rule_mult, IAllPaths_mult, rule_theta));
-
-                    GrB_Semiring rule_semiring;
-                    GRB_TRY(GrB_Semiring_new(&rule_semiring, AllPaths_monoid, rule_mult));
-
-                    GrB_BinaryOp acc_op = t_empty_flags[cur_A] ? GrB_NULL : AllPaths_add;
-
-                    GRB_TRY(GrB_mxm(T[cur_A], outputs_reachability[cur_A], acc_op,
-                        rule_semiring, outputs_reachability[cur_pA],
-                        outputs_reachability[cur_pB], desc_s));
-
-                    GrB_free(&rule_semiring);
-                    GrB_free(&rule_mult);
-
-                    t_empty_flags[cur_A] = false;
+            if (pat->element == LAGraph_PAT_ALL_ELEMENTS) {
+                // CONV (all elements): S_m -> E_{im,k} S_{m ^ im}
+                // Iterates over all mask indices, automaton states, and blocks.
+                for (int64_t m = 0; m < N; m++)
+                for (int64_t im = 0; im < N; im++)
+                    for (int64_t qs = 0; qs < R; qs++)
+                    for (int64_t qm = 0; qm < R; qm++)
+                        for (int64_t qe = 0; qe < R; qe++)
+                        for (int64_t k = 0; k < K; k++) {
+                            int32_t cur_A  = pat_role_id(&pat->role[0], m, qs, qe, 0);
+                            int32_t cur_pA = pat_role_id(&pat->role[1], im, qs, qm, k);
+                            int32_t cur_pB = pat_role_id(&pat->role[2], m ^ im, qm, qe, 0);
+                            EXECUTE_CONCRETE_RULE(cur_A, cur_pA, cur_pB);
+                        }
+            } else {
+                // CONV (specific element): S_m -> P S_{m ^ el}
+                int64_t el = pat->element;
+                uint32_t st_count = pat->state ? pat->state->nnz : (uint32_t)R;
+                for (int64_t m = 0; m < N; m++)
+                for (uint32_t st = 0; st < st_count; st++) {
+                    int64_t qs   = pat->state ? pat->state->entries[st].row : st;
+                    int64_t qmid = pat->state ? pat->state->entries[st].col : st;
+                    for (int64_t qe = 0; qe < R; qe++) {
+                        int32_t cur_A  = pat_role_id(&pat->role[0], m, qs, qe, 0);
+                        int32_t cur_pA = bin_rule.prod_A;
+                        int32_t cur_pB = pat_role_id(&pat->role[2], m ^ el, qmid, qe, 0);
+                        EXECUTE_CONCRETE_RULE(cur_A, cur_pA, cur_pB);
+                    }
                 }
             }
-        } else {
-            // Standard binary rule processing
-
-            if (t_empty_flags[bin_rule.prod_A] || t_empty_flags[bin_rule.prod_B])
-                continue;
-
-            int32_t this_rule_id = (int32_t)rule_table_count;
-            LG_TRY(rule_table_push(&rule_table, &rule_table_count, &rule_table_cap,
-                            bin_rule.nonterm, bin_rule.prod_A, bin_rule.prod_B));
-
-            GRB_TRY(GrB_Scalar_setElement_INT32(rule_theta, this_rule_id));
-
-            GrB_BinaryOp rule_mult;
-            GRB_TRY(GxB_BinaryOp_new_IndexOp(&rule_mult, IAllPaths_mult, rule_theta));
-
-            GrB_Semiring rule_semiring;
-            GRB_TRY(GrB_Semiring_new(&rule_semiring, AllPaths_monoid, rule_mult));
-
-            GrB_BinaryOp acc_op = t_empty_flags[bin_rule.nonterm] ? GrB_NULL : AllPaths_add;
-            GRB_TRY(GrB_mxm(T[bin_rule.nonterm], outputs_reachability[bin_rule.nonterm],
-                acc_op, rule_semiring, outputs_reachability[bin_rule.prod_A],
-                outputs_reachability[bin_rule.prod_B], desc_s));
-
-            GrB_free(&rule_semiring);
-            GrB_free(&rule_mult);
-
-            t_empty_flags[bin_rule.nonterm] = false;
+            continue;
         }
+
+        if (pat != NULL && pat->kind == LAGraph_PAT_SCALE) {
+            // SCALE: S_{m,qs,qe} -> X * S_{m,qs,qe} (X is a plain symbol)
+            int64_t N = pat->masks, R = pat->states;
+            for (int64_t m = 0; m < N; m++)
+            for (int64_t qs = 0; qs < R; qs++)
+                for (int64_t qe = 0; qe < R; qe++) {
+                    int32_t cur_A  = pat_role_id(&pat->role[0], m, qs, qe, 0);
+                    int32_t cur_pA = bin_rule.prod_A;
+                    int32_t cur_pB = pat_role_id(&pat->role[2], m, qs, qe, 0);
+                    EXECUTE_CONCRETE_RULE(cur_A, cur_pA, cur_pB);
+                }
+            continue;
+        }
+
+        if (pat != NULL && (pat->kind == LAGraph_PAT_LEFT || pat->kind == LAGraph_PAT_RIGHT)) {
+            // LEFT / RIGHT: Indexed product rules for grammar pattern (E_i / G_i)
+            int64_t N = pat->masks, R = pat->states;
+            int64_t off = bin_rule.nonterm - pat->role[0].base;
+            if (off < 0 || off >= (int64_t)pat->idx_count)
+                continue;
+            int64_t i_idx = off;
+
+            for (int64_t im = 0; im < N; im++)
+            for (int64_t qs = 0; qs < R; qs++)
+                for (int64_t qm = 0; qm < R; qm++) {
+                    int32_t cur_A, cur_pA, cur_pB;
+                    if (pat->kind == LAGraph_PAT_LEFT) {
+                        cur_A  = pat_role_id(&pat->role[0], im, qs, qm, i_idx);
+                        cur_pA = bin_rule.prod_A; // A_i, plain
+                        cur_pB = pat_role_id(&pat->role[2], im, qs, qm, i_idx);
+                    } else {
+                        cur_A  = pat_role_id(&pat->role[0], im, qs, qm, i_idx);
+                        cur_pA = pat_role_id(&pat->role[1], im, qs, qm, 0); // S_{im,qs,qm}
+                        cur_pB = bin_rule.prod_B; // B_i, plain
+                    }
+                    EXECUTE_CONCRETE_RULE(cur_A, cur_pA, cur_pB);
+                }
+            continue;
+        }
+
+        // Standard binary rule processing
+
+        if (t_empty_flags[bin_rule.prod_A] || t_empty_flags[bin_rule.prod_B])
+            continue;
+
+        int32_t this_rule_id = (int32_t)rule_table_count;
+        LG_TRY(rule_table_push(&rule_table, &rule_table_count, &rule_table_cap,
+                        bin_rule.nonterm, bin_rule.prod_A, bin_rule.prod_B));
+
+        GRB_TRY(GrB_Scalar_setElement_INT32(rule_theta, this_rule_id));
+
+        GrB_BinaryOp rule_mult;
+        GRB_TRY(GxB_BinaryOp_new_IndexOp(&rule_mult, IAllPaths_mult, rule_theta));
+
+        GrB_Semiring rule_semiring;
+        GRB_TRY(GrB_Semiring_new(&rule_semiring, AllPaths_monoid, rule_mult));
+
+        GrB_BinaryOp acc_op = t_empty_flags[bin_rule.nonterm] ? GrB_NULL : AllPaths_add;
+        GRB_TRY(GrB_mxm(T[bin_rule.nonterm], outputs_reachability[bin_rule.nonterm],
+            acc_op, rule_semiring, outputs_reachability[bin_rule.prod_A],
+            outputs_reachability[bin_rule.prod_B], desc_s));
+
+        GrB_free(&rule_semiring);
+        GrB_free(&rule_mult);
+
+        t_empty_flags[bin_rule.nonterm] = false;
     }
 
     if (out_rule_table) {

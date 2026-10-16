@@ -18,6 +18,7 @@
 // https://github.com/FormalLanguageConstrainedPathQuerying/CFPQ_PyAlgo/tree/murav/optimize-matrix
 
 #include <GraphBLAS.h>
+#include <LAGraphX.h>
 
 // Several square matrices can be concatenated into a horizontal or vertical vector of
 // matrices for fast multiplication
@@ -48,7 +49,13 @@ typedef struct CFL_Matrix {
     bool is_lazy;
     // Fields of block optimization
     enum CFL_Matrix_block block_type;
+
+    GrB_Matrix pat_cache;
+    const void *pat_cache_key;
+    GrB_Index pat_cache_nvals;
 } CFL_Matrix;
+
+typedef struct Pat_Context Pat_Context;
 
 // Creates a CFL matrix from intialized GrB_Matrix
 //
@@ -82,7 +89,7 @@ GrB_Info CFL_matrix_free(CFL_Matrix **matrix);
 GrB_Info CFL_matrix_update(CFL_Matrix *matrix);
 
 GrB_Info CFL_mxm(CFL_Matrix *output, CFL_Matrix *first, CFL_Matrix *second, bool accum,
-                 bool swap, int8_t optimizations);
+                 bool swap, int8_t optimizations, const LAGraph_rule_Pat *pat, const Pat_Context *ctx);
 GrB_Info CFL_wise(CFL_Matrix *output, CFL_Matrix *first, CFL_Matrix *second, bool accum,
                   int8_t optimizations);
 

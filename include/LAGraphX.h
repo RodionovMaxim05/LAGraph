@@ -1500,15 +1500,78 @@ enum {
     LAGraph_EWNCF_INDEX_PROD_B = 1 << 2,
 };
 
+// Classification of indexed family rule types in Context-Free.
+typedef enum {
+    LAGraph_PAT_NONE = 0,
+    LAGraph_PAT_SCALE,   // S           -> X * S  (X plain)
+    LAGraph_PAT_RIGHT,   // G_i         -> S * B_i
+    LAGraph_PAT_LEFT,    // E_i         -> A_i * G_i
+    LAGraph_PAT_CONV,    // S_m         -> sum L * S_{m o el}
+    LAGraph_PAT_EPS,     // S_{m,qs,qe} -> eps
+    LAGraph_PAT_PROJECT  // X           -> S_{m,qs,qe} (* Eps)  (plain X, n x n)
+} LAGraph_Pat_kind;
+
+// Supported algebraic group structures for family operations.
+typedef enum {
+    LAGraph_PAT_GROUP_XOR = 0, // m o x = m ^ x (Bitwise XOR group)
+    // LAGraph_PAT_GROUP_ADD_MOD  // m o x = (m + x) mod N - example
+} LAGraph_Pat_group;
+
+// Where the symbols of one role of the rule live in the ORIGINAL numbering:
+//   id(m, qr, qc, i) = base + m*mask_stride + qr*qrow_stride + qc*qcol_stride + i
+typedef enum {
+    LAGraph_PAT_SYM_PLAIN = 0, // ordinary symbol, `indexed` flags describe it as before
+    LAGraph_PAT_SYM_S,         // S family  -> one n' x (N n') stack
+    LAGraph_PAT_SYM_PATILY     // E / G     -> one (N k n') x n' stack
+} LAGraph_Pat_sym;
+
+// Definition of how symbol IDs for a rule role are mapped/decoded.
 typedef struct {
-    int32_t S_operand_base;     // Base symbol id of the operand family
-    int64_t S_stride;           // Symbol id spacing between family member m and m+1
-    int32_t S_target_base;      // Base symbol id of the target family
-    int64_t N;                  // Number of family members (parity states)
-    int64_t *active_masks;      // active_masks[idx] = XOR mask `im` for term idx
-    int32_t *p_ids;             // p_ids[idx] = symbol id of the P-operand for term idx
-    int64_t active_masks_count; // Number of (mask, P) terms in the family
-} XorFamilyRouting;
+    LAGraph_Pat_sym kind; // Symbol category (PLAIN, S, or PATILY)
+    int32_t base;         // Base symbol identifier in the global grammar numbering
+    int64_t mask_stride;  // Stride multiplier for the mask index (m)
+    int64_t qrow_stride;  // Stride multiplier for the source automaton state (qr)
+    int64_t qcol_stride;  // Stride multiplier for the target automaton state (qc)
+} LAGraph_Pat_role;
+
+// Represents an individual transition mapping in the state map.
+//
+// Defines R x R 0/1 automaton state mapping: T[row, col] = 1 indicates that
+// target state `row` accepts the operand in state `col`.
+typedef struct {
+    int32_t row; // Target automaton state row index
+    int32_t col; // Source automaton state column index
+} LAGraph_Pat_state_entry;
+
+// Collection of state transition entries for automaton lifting.
+// A NULL pointer in the rule descriptor denotes an identity mapping.
+typedef struct {
+    uint32_t nnz;                           // Number of non-zero entries in the state map
+    const LAGraph_Pat_state_entry *entries; // Array of state transition entries
+} LAGraph_Pat_state_map;
+
+// Constant representing all group elements simultaneously (used in CONV rule kind)
+#define LAGraph_PAT_ALL_ELEMENTS ((int64_t)-1)
+
+// Descriptor for indexed pattern production rules.
+typedef struct LAGraph_rule_Pat {
+    LAGraph_Pat_kind kind;              // Kind of the pattern rule
+    LAGraph_Pat_group group;            // Algebraic group operation type
+    uint32_t masks;                     // N: Group size (1 if the pattern has no mask index)
+    uint32_t states;                    // R: Number of automaton states (1 if no states)
+    uint32_t idx_count;                 // k: Number of indexed blocks / items (1 if no index i)
+    LAGraph_Pat_role role[3];           // Role mapping descriptors: [0] nonterm, [1] prod_A, [2] prod_B
+
+    // Convolution (CONV) specific fields
+    int64_t element;                    // Specific group element, or LAGraph_PAT_ALL_ELEMENTS 
+                                        // (in which case prod_A is the E family; Ebar_im picks el = im)
+    const LAGraph_Pat_state_map *state; // State transition map for plain prod_A only; NULL = identity
+
+    // Concrete symbol ID for EPS and PROJECT rules:
+    //   - EPS:      S_{m,qr,qc} target block symbol
+    //   - PROJECT:  prod_A = S_{m,qr,qc} source block symbol
+    int32_t block_symbol;
+} LAGraph_rule_Pat;
 
 // Production rule of Context-free grammar in Extended Weak Chomsky Normal Form
 //
@@ -1586,12 +1649,12 @@ typedef struct {
 //   N -> eps
 //   and indexed rules.
  typedef struct {
-    int32_t nonterm;               // LHS nonterminal symbol id
-    int32_t prod_A;                // first RHS symbol id or -1
-    int32_t prod_B;                // second RHS symbol id or -1
-    uint32_t indexed_count;        // Number of indexed rules (zero if not indexed)
-    uint8_t indexed;               // Bitmask of indexed symbols
-    XorFamilyRouting *xor_routing; // NULL, or a XOR-family routing layered on top of this rule
+    int32_t nonterm;             // LHS nonterminal symbol id
+    int32_t prod_A;              // first RHS symbol id or -1
+    int32_t prod_B;              // second RHS symbol id or -1
+    uint32_t indexed_count;      // Number of indexed rules (zero if not indexed)
+    uint8_t indexed;             // Bitmask of indexed symbols
+    const LAGraph_rule_Pat *pat; // Pointer to pattern optimization descriptor (NULL if optimization is not applied)
 } LAGraph_rule_EWCNF;
 
 // LAGraph_CFL_reachability: Context-Free Language Reachability Matrix-Based Algorithm
