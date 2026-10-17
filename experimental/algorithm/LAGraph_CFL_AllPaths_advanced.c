@@ -70,6 +70,13 @@ static void set_all_paths(AllPathsElem *z, const AllPathsElem *x,
 #define EXECUTE_CONCRETE_RULE(cur_A, cur_pA, cur_pB)                                     \
     do {                                                                                 \
         if (!t_empty_flags[(cur_pA)] && !t_empty_flags[(cur_pB)]) {                      \
+            GrB_Index mask_nvals = 0;                                                    \
+            if (outputs_reachability[(cur_A)] != NULL) {                                 \
+                GrB_Matrix_nvals(&mask_nvals, outputs_reachability[(cur_A)]);            \
+            }                                                                            \
+            if (mask_nvals == 0) {                                                       \
+                break;                                                                   \
+            }                                                                            \
             int32_t this_rule_id = (int32_t)rule_table_count;                            \
             LG_TRY(rule_table_push(&rule_table, &rule_table_count, &rule_table_cap,      \
                                     (cur_A), (cur_pA), (cur_pB)));                       \
@@ -304,25 +311,30 @@ GrB_Info LAGraph_CFL_AllPaths_adv(GrB_Matrix *outputs, GrB_Type *all_paths_ptr_t
                 for (int64_t m = 0; m < N; m++)
                 for (int64_t im = 0; im < N; im++)
                     for (int64_t qs = 0; qs < R; qs++)
-                    for (int64_t qm = 0; qm < R; qm++)
-                        for (int64_t qe = 0; qe < R; qe++)
-                        for (int64_t k = 0; k < K; k++) {
-                            int32_t cur_A  = pat_role_id(&pat->role[0], m, qs, qe, 0);
-                            int32_t cur_pA = pat_role_id(&pat->role[1], im, qs, qm, k);
-                            int32_t cur_pB = pat_role_id(&pat->role[2], m ^ im, qm, qe, 0);
-                            EXECUTE_CONCRETE_RULE(cur_A, cur_pA, cur_pB);
-                        }
+                        for (int64_t qm = 0; qm < R; qm++)
+                            for (int64_t k = 0; k < K; k++) {
+                                int32_t cur_pA = pat_role_id(&pat->role[1], im, qs, qm, k);
+                                if (t_empty_flags[cur_pA]) continue;
+
+                                for (int64_t qe = 0; qe < R; qe++) {
+                                    int32_t cur_A  = pat_role_id(&pat->role[0], m, qs, qe, 0);
+                                    int32_t cur_pB = pat_role_id(&pat->role[2], m ^ im, qm, qe, 0);
+                                    EXECUTE_CONCRETE_RULE(cur_A, cur_pA, cur_pB);
+                                }
+                            }
             } else {
                 // CONV (specific element): S_m -> P S_{m ^ el}
                 int64_t el = pat->element;
                 uint32_t st_count = pat->state ? pat->state->nnz : (uint32_t)R;
+                int32_t cur_pA = bin_rule.prod_A;
+                if (t_empty_flags[cur_pA]) continue;
+
                 for (int64_t m = 0; m < N; m++)
                 for (uint32_t st = 0; st < st_count; st++) {
                     int64_t qs   = pat->state ? pat->state->entries[st].row : st;
                     int64_t qmid = pat->state ? pat->state->entries[st].col : st;
                     for (int64_t qe = 0; qe < R; qe++) {
                         int32_t cur_A  = pat_role_id(&pat->role[0], m, qs, qe, 0);
-                        int32_t cur_pA = bin_rule.prod_A;
                         int32_t cur_pB = pat_role_id(&pat->role[2], m ^ el, qmid, qe, 0);
                         EXECUTE_CONCRETE_RULE(cur_A, cur_pA, cur_pB);
                     }
@@ -334,11 +346,13 @@ GrB_Info LAGraph_CFL_AllPaths_adv(GrB_Matrix *outputs, GrB_Type *all_paths_ptr_t
         if (pat != NULL && pat->kind == LAGraph_PAT_SCALE) {
             // SCALE: S_{m,qs,qe} -> X * S_{m,qs,qe} (X is a plain symbol)
             int64_t N = pat->masks, R = pat->states;
+            int32_t cur_pA = bin_rule.prod_A;
+            if (t_empty_flags[cur_pA]) continue;
+
             for (int64_t m = 0; m < N; m++)
             for (int64_t qs = 0; qs < R; qs++)
                 for (int64_t qe = 0; qe < R; qe++) {
                     int32_t cur_A  = pat_role_id(&pat->role[0], m, qs, qe, 0);
-                    int32_t cur_pA = bin_rule.prod_A;
                     int32_t cur_pB = pat_role_id(&pat->role[2], m, qs, qe, 0);
                     EXECUTE_CONCRETE_RULE(cur_A, cur_pA, cur_pB);
                 }
@@ -358,12 +372,16 @@ GrB_Info LAGraph_CFL_AllPaths_adv(GrB_Matrix *outputs, GrB_Type *all_paths_ptr_t
                 for (int64_t qm = 0; qm < R; qm++) {
                     int32_t cur_A, cur_pA, cur_pB;
                     if (pat->kind == LAGraph_PAT_LEFT) {
-                        cur_A  = pat_role_id(&pat->role[0], im, qs, qm, i_idx);
                         cur_pA = bin_rule.prod_A; // A_i, plain
+                        if (t_empty_flags[cur_pA]) continue;
+
+                        cur_A  = pat_role_id(&pat->role[0], im, qs, qm, i_idx);
                         cur_pB = pat_role_id(&pat->role[2], im, qs, qm, i_idx);
                     } else {
-                        cur_A  = pat_role_id(&pat->role[0], im, qs, qm, i_idx);
                         cur_pA = pat_role_id(&pat->role[1], im, qs, qm, 0); // S_{im,qs,qm}
+                        if (t_empty_flags[cur_pA]) continue;
+
+                        cur_A  = pat_role_id(&pat->role[0], im, qs, qm, i_idx);
                         cur_pB = bin_rule.prod_B; // B_i, plain
                     }
                     EXECUTE_CONCRETE_RULE(cur_A, cur_pA, cur_pB);
@@ -374,6 +392,13 @@ GrB_Info LAGraph_CFL_AllPaths_adv(GrB_Matrix *outputs, GrB_Type *all_paths_ptr_t
         // Standard binary rule processing
 
         if (t_empty_flags[bin_rule.prod_A] || t_empty_flags[bin_rule.prod_B])
+            continue;
+
+        GrB_Index mask_nvals = 0;
+        if (outputs_reachability[bin_rule.nonterm] != NULL) {
+            GrB_Matrix_nvals(&mask_nvals, outputs_reachability[bin_rule.nonterm]);
+        }
+        if (mask_nvals == 0)
             continue;
 
         int32_t this_rule_id = (int32_t)rule_table_count;
