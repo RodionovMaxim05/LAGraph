@@ -268,7 +268,7 @@ static void test_CFL_mxm(void) {
         matrix_to_format(A, GrB_ROWMAJOR, true);
         CFL_matrix_create(&C, 2, 2);
 
-        OK(CFL_mxm(C, A, B, false, false, mask));
+        OK(CFL_mxm(C, A, B, false, false, mask, NULL, NULL));
         TEST_MSG("matrix_mxm_opt failed for mask=%d", mask);
 
         GrB_Index nvals = 0;
@@ -575,7 +575,7 @@ static void test_CFL_format_mxm_second_greather_then_k(void) {
     CFL_matrix_create(&C, 5, 5);
 
     OK(matrix_to_format(A, GrB_COLMAJOR, false));
-    OK(CFL_mxm(C, A, B, false, false, OPT_FORMAT));
+    OK(CFL_mxm(C, A, B, false, false, OPT_FORMAT, NULL, NULL));
     TEST_CHECK(C->nvals == 0);
 
     OK(free_matrix(&A));
@@ -667,7 +667,7 @@ static void test_CFL_empty_mxm_one_is_empty(void) {
     make_ones_matrix(&B, 5);
     make_ones_matrix(&C, 5);
 
-    OK(CFL_mxm(C, A, B, true, false, OPT_EMPTY));
+    OK(CFL_mxm(C, A, B, true, false, OPT_EMPTY, NULL, NULL));
     TEST_CHECK(C->nvals == 25);
 
     OK(CFL_matrix_free(&A));
@@ -679,7 +679,7 @@ static void test_CFL_empty_mxm_one_is_empty(void) {
     make_ones_matrix(&B, 5);
     make_ones_matrix(&C, 5);
 
-    OK(CFL_mxm(C, A, B, false, false, OPT_EMPTY));
+    OK(CFL_mxm(C, A, B, false, false, OPT_EMPTY, NULL, NULL));
     TEST_CHECK(C->nvals == 0);
 
     OK(CFL_matrix_free(&A));
@@ -691,7 +691,7 @@ static void test_CFL_empty_mxm_one_is_empty(void) {
     make_ones_matrix(&B, 5);
     CFL_matrix_create(&C, 5, 5);
 
-    OK(CFL_mxm(C, A, B, false, false, OPT_EMPTY));
+    OK(CFL_mxm(C, A, B, false, false, OPT_EMPTY, NULL, NULL));
     TEST_CHECK(C->nvals == 0);
 
     OK(CFL_matrix_free(&A));
@@ -873,8 +873,8 @@ static void test_CFL_lazy_mxm(void) {
             OK(CFL_matrix_to_base(&B_base, B, OPT_LAZY));
             OK(CFL_matrix_to_base(&C_base, C, OPT_LAZY));
 
-            OK(CFL_mxm(C, A, B, is_accum, is_reverse, OPT_LAZY));
-            OK(CFL_mxm(C_base, A_base, B_base, is_accum, is_reverse, 0));
+            OK(CFL_mxm(C, A, B, is_accum, is_reverse, OPT_LAZY, NULL, NULL));
+            OK(CFL_mxm(C_base, A_base, B_base, is_accum, is_reverse, 0, NULL, NULL));
 
             TEST_CHECK(compare_matrices(C, C_base));
 
@@ -899,8 +899,8 @@ static void test_CFL_lazy_mxm(void) {
             OK(CFL_matrix_to_base(&B_base, B, OPT_LAZY));
             OK(CFL_matrix_to_base(&C_base, C, OPT_LAZY));
 
-            OK(CFL_mxm(C, A, B, is_accum, is_reverse, OPT_LAZY));
-            OK(CFL_mxm(C_base, A_base, B_base, is_accum, is_reverse, 0));
+            OK(CFL_mxm(C, A, B, is_accum, is_reverse, OPT_LAZY, NULL, NULL));
+            OK(CFL_mxm(C_base, A_base, B_base, is_accum, is_reverse, 0, NULL, NULL));
 
             TEST_CHECK(compare_matrices(C, C_base));
 
@@ -1108,7 +1108,7 @@ static void test_CFL_block_mxm(void) {
                                           second_format == CELL ? 20 : 20 * 20);
                     }
 
-                    OK(CFL_mxm(C, A, B, is_accum, is_reverse, OPT_BLOCK));
+                    OK(CFL_mxm(C, A, B, is_accum, is_reverse, OPT_BLOCK, NULL, NULL));
 
                     OK(free_matrix(&A));
                     OK(free_matrix(&B));
