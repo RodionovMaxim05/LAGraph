@@ -7,27 +7,33 @@
         }                                                                                \
         LAGraph_Free((void **)&outputs_reachability, NULL);                              \
         LAGraph_Free((void **)&T, NULL);                                                 \
-        GrB_free(&false_scalar);                                                         \
         GrB_free(&identity_matrix);                                                      \
         GrB_free(&v_diag);                                                               \
-        LAGraph_Free((void **)&t_empty_flags, NULL);                                     \
         LAGraph_Free((void **)&eps_rules, NULL);                                         \
         LAGraph_Free((void **)&term_rules, NULL);                                        \
         LAGraph_Free((void **)&bin_rules, NULL);                                         \
         LAGraph_Free((void **)&new_rules, NULL);                                         \
         GrB_free(&AllPaths_monoid);                                                      \
-        GrB_free(&bottom_scalar);                                                        \
         GrB_free(&IAllPaths_mult);                                                       \
-        GrB_free(&AllPaths_set);                                                         \
         GrB_free(&AllPaths_add);                                                         \
         GrB_free(&rule_theta);                                                           \
         GrB_free(&desc_s);                                                               \
+        GrB_free(&make_empty_elem_op);                                                   \
         LAGraph_Free((void **)&rule_table, NULL);                                        \
     }
 
 #include "LG_internal.h"
 #include <LAGraphX.h>
 #include "LAGraph_CFL_AllPaths_internal.h"
+
+// Auxiliary unary function for creating an empty element
+static void make_empty_elem(AllPathsElem *z, const bool *x) {
+    z->n = 0;
+    z->data.single_elem.mid = GrB_INDEX_MAX;
+    z->data.single_elem.rule_count = 0;
+    z->data.single_elem.rule_id0 = -1;
+    z->data.single_elem.rest.rule_ids_rest = NULL;
+}
 
 // Post-multiplication operation creating path element containing intermediate vertex jx and rule_id
 static void mult_all_paths_post(AllPathsElem *z, const void *x, GrB_Index ix,
@@ -66,32 +72,29 @@ static void set_all_paths(AllPathsElem *z, const AllPathsElem *x,
     "  z->n = 1; \n"                                                                     \
     "}"
 
-// Helper function to execute a concrete binary rule for pattern optimization (OPT_PAT).
 #define EXECUTE_CONCRETE_RULE(cur_A, cur_pA, cur_pB)                                     \
     do {                                                                                 \
-        if (!t_empty_flags[(cur_pA)] && !t_empty_flags[(cur_pB)]) {                      \
-            GrB_Index mask_nvals = 0;                                                    \
-            if (outputs_reachability[(cur_A)] != NULL) {                                 \
-                GrB_Matrix_nvals(&mask_nvals, outputs_reachability[(cur_A)]);            \
-            }                                                                            \
-            if (mask_nvals == 0) {                                                       \
-                break;                                                                   \
-            }                                                                            \
+        GrB_Index nnz_A = 0, nnz_pA = 0, nnz_pB = 0;                                     \
+        if (outputs_reachability[(cur_A)] != NULL)                                       \
+            GrB_Matrix_nvals(&nnz_A, outputs_reachability[(cur_A)]);                     \
+        if (outputs_reachability[(cur_pA)] != NULL)                                      \
+            GrB_Matrix_nvals(&nnz_pA, outputs_reachability[(cur_pA)]);                   \
+        if (outputs_reachability[(cur_pB)] != NULL)                                      \
+            GrB_Matrix_nvals(&nnz_pB, outputs_reachability[(cur_pB)]);                   \
+        if (nnz_A > 0 && nnz_pA > 0 && nnz_pB > 0) {                                     \
             int32_t this_rule_id = (int32_t)rule_table_count;                            \
             LG_TRY(rule_table_push(&rule_table, &rule_table_count, &rule_table_cap,      \
-                                    (cur_A), (cur_pA), (cur_pB)));                       \
+                                   (cur_A), (cur_pA), (cur_pB)));                        \
             GRB_TRY(GrB_Scalar_setElement_INT32(rule_theta, this_rule_id));              \
             GrB_BinaryOp rule_mult;                                                      \
             GRB_TRY(GxB_BinaryOp_new_IndexOp(&rule_mult, IAllPaths_mult, rule_theta));   \
             GrB_Semiring rule_semiring;                                                  \
             GRB_TRY(GrB_Semiring_new(&rule_semiring, AllPaths_monoid, rule_mult));       \
-            GrB_BinaryOp acc_op = t_empty_flags[(cur_A)] ? GrB_NULL : AllPaths_add;      \
-            GRB_TRY(GrB_mxm(T[(cur_A)], outputs_reachability[(cur_A)],                   \
-                            acc_op, rule_semiring, outputs_reachability[(cur_pA)],       \
+            GRB_TRY(GrB_mxm(T[(cur_A)], outputs_reachability[(cur_A)], AllPaths_add,     \
+                            rule_semiring, outputs_reachability[(cur_pA)],               \
                             outputs_reachability[(cur_pB)], desc_s));                    \
             GrB_free(&rule_semiring);                                                    \
             GrB_free(&rule_mult);                                                        \
-            t_empty_flags[(cur_A)] = false;                                              \
         }                                                                                \
     } while (0)
 
@@ -119,9 +122,7 @@ GrB_Info LAGraph_CFL_AllPaths_adv(GrB_Matrix *outputs, GrB_Type *all_paths_ptr_t
     GrB_Type AllPaths_type = NULL;
 
     GrB_Matrix *T = NULL;
-    GrB_Scalar false_scalar = NULL;
     GrB_Matrix *outputs_reachability = NULL;
-    bool *t_empty_flags = NULL;
     LAGraph_rule_EWCNF *new_rules = NULL;
     size_t new_rules_count = 0;
     size_t *eps_rules = NULL, eps_rules_count = 0;
@@ -129,6 +130,7 @@ GrB_Info LAGraph_CFL_AllPaths_adv(GrB_Matrix *outputs, GrB_Type *all_paths_ptr_t
     size_t *bin_rules = NULL, bin_rules_count = 0;
     GrB_Matrix identity_matrix = NULL;
     GrB_Vector v_diag = NULL;
+    GrB_UnaryOp make_empty_elem_op = NULL;
 
 #if GxB_IMPLEMENTATION < GxB_VERSION(9, 4, 5)
     return (GrB_NOT_IMPLEMENTED);
@@ -136,8 +138,6 @@ GrB_Info LAGraph_CFL_AllPaths_adv(GrB_Matrix *outputs, GrB_Type *all_paths_ptr_t
     GrB_BinaryOp AllPaths_add = NULL;
     GrB_Monoid AllPaths_monoid = NULL;
     GxB_IndexBinaryOp IAllPaths_mult = NULL;
-    GrB_BinaryOp AllPaths_set = NULL;
-    GrB_Scalar bottom_scalar = NULL;
     GrB_Scalar rule_theta = NULL;
     GrB_Descriptor desc_s = NULL;
 
@@ -152,9 +152,6 @@ GrB_Info LAGraph_CFL_AllPaths_adv(GrB_Matrix *outputs, GrB_Type *all_paths_ptr_t
     AllPaths_type = *all_paths_ptr_t;
 
     AllPathsElem bottom = {0};
-    GRB_TRY(GrB_Scalar_new(&bottom_scalar, AllPaths_type));
-    GRB_TRY(GrB_Scalar_setElement_UDT(bottom_scalar, (void *)(&bottom)));
-
     GRB_TRY(GrB_BinaryOp_new(&AllPaths_add, (void *)add_all_paths, AllPaths_type,
                              AllPaths_type, AllPaths_type));
     GRB_TRY(GrB_Monoid_new(&AllPaths_monoid, AllPaths_add, (void *)(&bottom)));
@@ -163,8 +160,7 @@ GrB_Info LAGraph_CFL_AllPaths_adv(GrB_Matrix *outputs, GrB_Type *all_paths_ptr_t
                                   AllPaths_type, GrB_BOOL, GrB_BOOL, GrB_INT32,
                                   "mult_all_paths_post", MULT_PATH_POST_INDEX_DEFN));
 
-    GRB_TRY(GrB_BinaryOp_new(&AllPaths_set, (void *)set_all_paths, AllPaths_type,
-                             AllPaths_type, GrB_BOOL));
+    GRB_TRY(GrB_UnaryOp_new(&make_empty_elem_op, (void *)make_empty_elem, AllPaths_type, GrB_BOOL));
 
     LG_ASSERT_MSG(outputs != NULL, GrB_NULL_POINTER, "The outputs array cannot be null.");
     LG_CLEAR_MSG;
@@ -210,11 +206,6 @@ GrB_Info LAGraph_CFL_AllPaths_adv(GrB_Matrix *outputs, GrB_Type *all_paths_ptr_t
         }
     }
 
-    LG_TRY(LAGraph_Calloc((void **)&T, symbols_amount, sizeof(GrB_Matrix), msg));
-    GRB_TRY(GrB_Scalar_new(&false_scalar, GrB_BOOL));
-    GRB_TRY(GrB_Scalar_setElement_BOOL(false_scalar, false));
-    LG_TRY(LAGraph_Calloc((void **)&t_empty_flags, symbols_amount, sizeof(bool), msg));
-
     GrB_Index n = 0;
     for (size_t i = 0; i < symbols_amount; i++) {
         if (adj_matrices[i] != NULL) {
@@ -223,9 +214,18 @@ GrB_Info LAGraph_CFL_AllPaths_adv(GrB_Matrix *outputs, GrB_Type *all_paths_ptr_t
         }
     }
 
+    // Initialize and preallocate T[i] in advance, following the exact pattern of outputs_reachability[i]
+    LG_TRY(LAGraph_Calloc((void **)&T, symbols_amount, sizeof(GrB_Matrix), msg));
     for (size_t i = 0; i < symbols_amount; i++) {
         GRB_TRY(GrB_Matrix_new(&T[i], AllPaths_type, n, n));
-        t_empty_flags[i] = true;
+        GrB_Index r_nnz = 0;
+        if (outputs_reachability[i] != NULL) {
+            GRB_TRY(GrB_Matrix_nvals(&r_nnz, outputs_reachability[i]));
+            if (r_nnz > 0) {
+                GRB_TRY(GrB_apply(T[i], GrB_NULL, GrB_NULL, make_empty_elem_op,
+                                  outputs_reachability[i], GrB_NULL));
+            }
+        }
     }
 
     LG_TRY(LAGraph_Calloc((void **)&eps_rules, new_rules_count, sizeof(size_t), msg));
@@ -248,20 +248,30 @@ GrB_Info LAGraph_CFL_AllPaths_adv(GrB_Matrix *outputs, GrB_Type *all_paths_ptr_t
         }
     }
 
-    for (size_t i = 0; i < term_rules_count; i++) {
-        LAGraph_rule_EWCNF term_rule = new_rules[term_rules[i]];
-        if (adj_matrices[term_rule.prod_A] == NULL)
-            continue;
+    GRB_TRY(GrB_Descriptor_new(&desc_s));
+    GRB_TRY(GrB_Descriptor_set(desc_s, GrB_MASK, GrB_STRUCTURE));
 
-        GrB_Index adj_matrix_nnz = 0;
-        GRB_TRY(GrB_Matrix_nvals(&adj_matrix_nnz, adj_matrices[term_rule.prod_A]));
-        if (adj_matrix_nnz == 0)
-            continue;
+    if (term_rules_count > 0) {
+        AllPathsElem term_elem = {0};
+        set_all_paths(&term_elem, NULL, NULL);
+        GrB_Scalar term_scalar = NULL;
+        GRB_TRY(GrB_Scalar_new(&term_scalar, AllPaths_type));
+        GRB_TRY(GrB_Scalar_setElement_UDT(term_scalar, (void *)&term_elem));
 
-        GxB_eWiseUnion(T[term_rule.nonterm], GrB_NULL, GrB_NULL, AllPaths_set,
-                       T[term_rule.nonterm], bottom_scalar,
-                       adj_matrices[term_rule.prod_A], false_scalar, GrB_NULL);
-        t_empty_flags[term_rule.nonterm] = false;
+        for (size_t i = 0; i < term_rules_count; i++) {
+            LAGraph_rule_EWCNF term_rule = new_rules[term_rules[i]];
+            if (adj_matrices[term_rule.prod_A] == NULL)
+                continue;
+
+            GrB_Index adj_matrix_nnz = 0;
+            GRB_TRY(GrB_Matrix_nvals(&adj_matrix_nnz, adj_matrices[term_rule.prod_A]));
+            if (adj_matrix_nnz == 0)
+                continue;
+
+            GRB_TRY(GrB_assign(T[term_rule.nonterm], adj_matrices[term_rule.prod_A],
+                               AllPaths_add, term_scalar, GrB_ALL, n, GrB_ALL, n, desc_s));
+        }
+        GrB_free(&term_scalar);
     }
 
     if (eps_rules_count > 0) {
@@ -271,30 +281,22 @@ GrB_Info LAGraph_CFL_AllPaths_adv(GrB_Matrix *outputs, GrB_Type *all_paths_ptr_t
         GRB_TRY(GrB_Matrix_diag(&identity_matrix, v_diag, 0));
         GRB_TRY(GrB_free(&v_diag));
 
+        AllPathsElem eps_elem = {0};
+        set_all_paths(&eps_elem, NULL, NULL);
+        GrB_Scalar eps_scalar = NULL;
+        GRB_TRY(GrB_Scalar_new(&eps_scalar, AllPaths_type));
+        GRB_TRY(GrB_Scalar_setElement_UDT(eps_scalar, (void *)&eps_elem));
+
         for (size_t i = 0; i < eps_rules_count; i++) {
             LAGraph_rule_EWCNF eps_rule = new_rules[eps_rules[i]];
-            GrB_BinaryOp acc_op =
-                t_empty_flags[eps_rule.nonterm] ? GrB_NULL : AllPaths_add;
-            GxB_eWiseUnion(T[eps_rule.nonterm], GrB_NULL, acc_op, AllPaths_set,
-                           T[eps_rule.nonterm], bottom_scalar, identity_matrix,
-                           false_scalar, GrB_NULL);
-            t_empty_flags[eps_rule.nonterm] = false;
+            GRB_TRY(GrB_assign(T[eps_rule.nonterm], identity_matrix,
+                               AllPaths_add, eps_scalar, GrB_ALL, n, GrB_ALL, n, desc_s));
         }
+        GrB_free(&eps_scalar);
         GrB_free(&identity_matrix);
     }
 
-    for (size_t i = 0; i < symbols_amount; i++) {
-        GrB_Index temp_nvals = 0;
-        GRB_TRY(GrB_Matrix_nvals(&temp_nvals, outputs_reachability[i]));
-        if (temp_nvals != 0) {
-            t_empty_flags[i] = false;
-        }
-    }
-
     GRB_TRY(GrB_Scalar_new(&rule_theta, GrB_INT32));
-
-    GRB_TRY(GrB_Descriptor_new(&desc_s));
-    GRB_TRY(GrB_Descriptor_set(desc_s, GrB_MASK, GrB_STRUCTURE));
 
     for (size_t i = 0; i < bin_rules_count; i++) {
         LAGraph_rule_EWCNF bin_rule = new_rules[bin_rules[i]];
@@ -312,29 +314,24 @@ GrB_Info LAGraph_CFL_AllPaths_adv(GrB_Matrix *outputs, GrB_Type *all_paths_ptr_t
                 for (int64_t im = 0; im < N; im++)
                     for (int64_t qs = 0; qs < R; qs++)
                         for (int64_t qm = 0; qm < R; qm++)
-                            for (int64_t k = 0; k < K; k++) {
-                                int32_t cur_pA = pat_role_id(&pat->role[1], im, qs, qm, k);
-                                if (t_empty_flags[cur_pA]) continue;
-
-                                for (int64_t qe = 0; qe < R; qe++) {
+                            for (int64_t qe = 0; qe < R; qe++)
+                                for (int64_t k = 0; k < K; k++) {
                                     int32_t cur_A  = pat_role_id(&pat->role[0], m, qs, qe, 0);
+                                    int32_t cur_pA = pat_role_id(&pat->role[1], im, qs, qm, k);
                                     int32_t cur_pB = pat_role_id(&pat->role[2], m ^ im, qm, qe, 0);
                                     EXECUTE_CONCRETE_RULE(cur_A, cur_pA, cur_pB);
                                 }
-                            }
             } else {
                 // CONV (specific element): S_m -> P S_{m ^ el}
                 int64_t el = pat->element;
                 uint32_t st_count = pat->state ? pat->state->nnz : (uint32_t)R;
-                int32_t cur_pA = bin_rule.prod_A;
-                if (t_empty_flags[cur_pA]) continue;
-
                 for (int64_t m = 0; m < N; m++)
                 for (uint32_t st = 0; st < st_count; st++) {
                     int64_t qs   = pat->state ? pat->state->entries[st].row : st;
                     int64_t qmid = pat->state ? pat->state->entries[st].col : st;
                     for (int64_t qe = 0; qe < R; qe++) {
                         int32_t cur_A  = pat_role_id(&pat->role[0], m, qs, qe, 0);
+                        int32_t cur_pA = bin_rule.prod_A;
                         int32_t cur_pB = pat_role_id(&pat->role[2], m ^ el, qmid, qe, 0);
                         EXECUTE_CONCRETE_RULE(cur_A, cur_pA, cur_pB);
                     }
@@ -346,13 +343,11 @@ GrB_Info LAGraph_CFL_AllPaths_adv(GrB_Matrix *outputs, GrB_Type *all_paths_ptr_t
         if (pat != NULL && pat->kind == LAGraph_PAT_SCALE) {
             // SCALE: S_{m,qs,qe} -> X * S_{m,qs,qe} (X is a plain symbol)
             int64_t N = pat->masks, R = pat->states;
-            int32_t cur_pA = bin_rule.prod_A;
-            if (t_empty_flags[cur_pA]) continue;
-
             for (int64_t m = 0; m < N; m++)
             for (int64_t qs = 0; qs < R; qs++)
                 for (int64_t qe = 0; qe < R; qe++) {
                     int32_t cur_A  = pat_role_id(&pat->role[0], m, qs, qe, 0);
+                    int32_t cur_pA = bin_rule.prod_A;
                     int32_t cur_pB = pat_role_id(&pat->role[2], m, qs, qe, 0);
                     EXECUTE_CONCRETE_RULE(cur_A, cur_pA, cur_pB);
                 }
@@ -372,16 +367,12 @@ GrB_Info LAGraph_CFL_AllPaths_adv(GrB_Matrix *outputs, GrB_Type *all_paths_ptr_t
                 for (int64_t qm = 0; qm < R; qm++) {
                     int32_t cur_A, cur_pA, cur_pB;
                     if (pat->kind == LAGraph_PAT_LEFT) {
-                        cur_pA = bin_rule.prod_A; // A_i, plain
-                        if (t_empty_flags[cur_pA]) continue;
-
                         cur_A  = pat_role_id(&pat->role[0], im, qs, qm, i_idx);
+                        cur_pA = bin_rule.prod_A; // A_i, plain
                         cur_pB = pat_role_id(&pat->role[2], im, qs, qm, i_idx);
                     } else {
-                        cur_pA = pat_role_id(&pat->role[1], im, qs, qm, 0); // S_{im,qs,qm}
-                        if (t_empty_flags[cur_pA]) continue;
-
                         cur_A  = pat_role_id(&pat->role[0], im, qs, qm, i_idx);
+                        cur_pA = pat_role_id(&pat->role[1], im, qs, qm, 0); // S_{im,qs,qm}
                         cur_pB = bin_rule.prod_B; // B_i, plain
                     }
                     EXECUTE_CONCRETE_RULE(cur_A, cur_pA, cur_pB);
@@ -391,14 +382,20 @@ GrB_Info LAGraph_CFL_AllPaths_adv(GrB_Matrix *outputs, GrB_Type *all_paths_ptr_t
 
         // Standard binary rule processing
 
-        if (t_empty_flags[bin_rule.prod_A] || t_empty_flags[bin_rule.prod_B])
+        if (outputs_reachability[bin_rule.nonterm] == NULL)
             continue;
 
-        GrB_Index mask_nvals = 0;
-        if (outputs_reachability[bin_rule.nonterm] != NULL) {
-            GrB_Matrix_nvals(&mask_nvals, outputs_reachability[bin_rule.nonterm]);
-        }
-        if (mask_nvals == 0)
+        GrB_Index nnz_A = 0;
+        GrB_Matrix_nvals(&nnz_A, outputs_reachability[bin_rule.nonterm]);
+        if (nnz_A == 0)
+            continue;
+
+        GrB_Index nnz_pA = 0, nnz_pB = 0;
+        if (outputs_reachability[bin_rule.prod_A] != NULL)
+            GrB_Matrix_nvals(&nnz_pA, outputs_reachability[bin_rule.prod_A]);
+        if (outputs_reachability[bin_rule.prod_B] != NULL)
+            GrB_Matrix_nvals(&nnz_pB, outputs_reachability[bin_rule.prod_B]);
+        if (nnz_pA == 0 || nnz_pB == 0)
             continue;
 
         int32_t this_rule_id = (int32_t)rule_table_count;
@@ -413,15 +410,13 @@ GrB_Info LAGraph_CFL_AllPaths_adv(GrB_Matrix *outputs, GrB_Type *all_paths_ptr_t
         GrB_Semiring rule_semiring;
         GRB_TRY(GrB_Semiring_new(&rule_semiring, AllPaths_monoid, rule_mult));
 
-        GrB_BinaryOp acc_op = t_empty_flags[bin_rule.nonterm] ? GrB_NULL : AllPaths_add;
         GRB_TRY(GrB_mxm(T[bin_rule.nonterm], outputs_reachability[bin_rule.nonterm],
-            acc_op, rule_semiring, outputs_reachability[bin_rule.prod_A],
-            outputs_reachability[bin_rule.prod_B], desc_s));
+                        AllPaths_add, rule_semiring,
+                        outputs_reachability[bin_rule.prod_A],
+                        outputs_reachability[bin_rule.prod_B], desc_s));
 
         GrB_free(&rule_semiring);
         GrB_free(&rule_mult);
-
-        t_empty_flags[bin_rule.nonterm] = false;
     }
 
     if (out_rule_table) {
