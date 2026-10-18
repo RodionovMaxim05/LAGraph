@@ -240,17 +240,47 @@ done:
 
 static GrB_Info pat_S_vert(GrB_Matrix *out, GrB_Matrix S, GrB_Index np, GrB_Index N) {
     GrB_Info info = GrB_SUCCESS;
-    pat_tup t = {0};
+    pat_tup t = {0}, o = {0};
+    GrB_Index *cnt = NULL, *pos = NULL;
     *out = NULL;
+
     PAT_TRY(tup_from_matrix(&t, S));
+    PAT_TRY(tup_alloc(&o, t.n));
+
+    if (LAGraph_Calloc((void **)&cnt, N, sizeof(GrB_Index), NULL) < 0 ||
+        LAGraph_Calloc((void **)&pos, N, sizeof(GrB_Index), NULL) < 0) {
+        PAT_FAIL(GrB_OUT_OF_MEMORY, "pat_S_vert: out of memory");
+    }
+
+    // Counting elements in each bucket
     for (GrB_Index i = 0; i < t.n; i++) {
         GrB_Index m = t.c[i] / np;
-        t.r[i] = m * np + t.r[i];
-        t.c[i] = t.c[i] % np;
+        cnt[m]++;
     }
-    PAT_TRY(tup_to_matrix(out, &t, N * np, np));
+
+    // Prefix sums -> starting positions
+    GrB_Index sum = 0;
+    for (GrB_Index m = 0; m < N; m++) {
+        pos[m] = sum;
+        sum += cnt[m];
+    }
+
+    // Distribution across the bins
+    for (GrB_Index i = 0; i < t.n; i++) {
+        GrB_Index m = t.c[i] / np;
+        GrB_Index d = pos[m]++;
+        o.r[d] = m * np + t.r[i];
+        o.c[d] = t.c[i] % np;
+    }
+    o.n = t.n;
+
+    PAT_TRY(tup_to_matrix(out, &o, N * np, np));
+
 done:
     tup_free(&t);
+    tup_free(&o);
+    LAGraph_Free((void **)&cnt, NULL);
+    LAGraph_Free((void **)&pos, NULL);
     return info;
 }
 
@@ -553,37 +583,149 @@ done:
 static GrB_Info pat_grid_to_stack(GrB_Matrix *out, GrB_Matrix P, GrB_Index np,
                                  GrB_Index rb, GrB_Index cb) {
     GrB_Info info = GrB_SUCCESS;
-    pat_tup t = {0};
+    pat_tup t = {0}, o = {0};
+    GrB_Index num_blocks = rb * cb;
+    GrB_Index *cnt = NULL, *pos = NULL;
     *out = NULL;
+
     PAT_TRY(tup_from_matrix(&t, P));
+    PAT_TRY(tup_alloc(&o, t.n));
+
+    if (LAGraph_Calloc((void **)&cnt, num_blocks, sizeof(GrB_Index), NULL) < 0 ||
+        LAGraph_Calloc((void **)&pos, num_blocks, sizeof(GrB_Index), NULL) < 0) {
+        PAT_FAIL(GrB_OUT_OF_MEMORY, "pat_grid_to_stack: out of memory");
+    }
+
+    // Counting elements in each bucket
+    for (GrB_Index i = 0; i < t.n; i++) {
+        GrB_Index I = t.r[i] / np;
+        GrB_Index J = t.c[i] / np;
+        GrB_Index b_idx = I * cb + J;
+        cnt[b_idx]++;
+    }
+
+    // Counting elements in each bucket
+    GrB_Index sum = 0;
+    for (GrB_Index b = 0; b < num_blocks; b++) {
+        pos[b] = sum;
+        sum += cnt[b];
+    }
+
+    // Distribution across the bins
     for (GrB_Index i = 0; i < t.n; i++) {
         GrB_Index I = t.r[i] / np, rr = t.r[i] % np;
         GrB_Index J = t.c[i] / np, cc = t.c[i] % np;
-        t.r[i] = (I * cb + J) * np + rr;
-        t.c[i] = cc;
+        GrB_Index b_idx = I * cb + J;
+        GrB_Index d = pos[b_idx]++;
+        o.r[d] = b_idx * np + rr;
+        o.c[d] = cc;
     }
-    PAT_TRY(tup_to_matrix(out, &t, rb * cb * np, np));
+    o.n = t.n;
+
+    PAT_TRY(tup_to_matrix(out, &o, rb * cb * np, np));
+
 done:
     tup_free(&t);
+    tup_free(&o);
+    LAGraph_Free((void **)&cnt, NULL);
+    LAGraph_Free((void **)&pos, NULL);
     return info;
+}
+
+typedef struct {
+    GrB_Index r;
+    GrB_Index c;
+} pat_pair;
+
+static int compare_pairs_c(const void *a, const void *b) {
+    const pat_pair *pa = (const pat_pair *)a;
+    const pat_pair *pb = (const pat_pair *)b;
+    if (pa->c < pb->c) return -1;
+    if (pa->c > pb->c) return 1;
+    return 0;
 }
 
 static GrB_Info pat_grid_fold_groups(GrB_Matrix *out, GrB_Matrix E, GrB_Index np,
                                     GrB_Index group, GrB_Index groups) {
     GrB_Info info = GrB_SUCCESS;
-    pat_tup t = {0};
+    pat_tup t = {0}, o = {0};
+    GrB_Index *cnt = NULL, *starts = NULL, *curr_pos = NULL;
+    pat_pair *pairs = NULL;
     *out = NULL;
+
     PAT_TRY(tup_from_matrix(&t, E));
+    if (t.n == 0) {
+        PAT_TRY(GrB_Matrix_new(out, GrB_BOOL, np, groups * np));
+        goto done;
+    }
+
+    if (LAGraph_Calloc((void **)&cnt, np, sizeof(GrB_Index), NULL) < 0 ||
+        LAGraph_Calloc((void **)&starts, np, sizeof(GrB_Index), NULL) < 0 ||
+        LAGraph_Calloc((void **)&curr_pos, np, sizeof(GrB_Index), NULL) < 0 ||
+        LAGraph_Malloc((void **)&pairs, t.n, sizeof(pat_pair), NULL) < 0) {
+        PAT_FAIL(GrB_OUT_OF_MEMORY, "pat_grid_fold_groups: out of memory");
+    }
+
+    // Counting elements by target rows
+    for (GrB_Index i = 0; i < t.n; i++) {
+        GrB_Index blk = t.r[i] / np;
+        GrB_Index rr = t.r[i] % np;
+        cnt[rr]++;
+    }
+
+    // Prefix sums -> starting positions
+    GrB_Index sum = 0;
+    for (GrB_Index rr = 0; rr < np; rr++) {
+        starts[rr] = sum;
+        curr_pos[rr] = sum;
+        sum += cnt[rr];
+    }
+
+    // Distribution of rows into buckets
     for (GrB_Index i = 0; i < t.n; i++) {
         GrB_Index blk = t.r[i] / np;
         GrB_Index rr = t.r[i] % np;
         GrB_Index g = blk / group;
-        t.r[i] = rr;
-        t.c[i] = g * np + t.c[i];
+        GrB_Index new_c = g * np + t.c[i];
+
+        GrB_Index d = curr_pos[rr]++;
+        pairs[d].r = rr;
+        pairs[d].c = new_c;
     }
-    PAT_TRY(tup_to_matrix(out, &t, np, groups * np));
+
+    // Sorting within each row and removing duplicates
+    PAT_TRY(tup_alloc(&o, t.n));
+    GrB_Index d_out = 0;
+
+    for (GrB_Index rr = 0; rr < np; rr++) {
+        GrB_Index count = cnt[rr];
+        if (count == 0) continue;
+
+        pat_pair *row_slice = pairs + starts[rr];
+        if (count > 1) {
+            qsort(row_slice, count, sizeof(pat_pair), compare_pairs_c);
+        }
+
+        // Removing duplicates from a sorted string
+        for (GrB_Index j = 0; j < count; j++) {
+            if (j == 0 || row_slice[j].c != row_slice[j - 1].c) {
+                o.r[d_out] = row_slice[j].r;
+                o.c[d_out] = row_slice[j].c;
+                d_out++;
+            }
+        }
+    }
+    o.n = d_out;
+
+    PAT_TRY(tup_to_matrix(out, &o, np, groups * np));
+
 done:
     tup_free(&t);
+    tup_free(&o);
+    LAGraph_Free((void **)&cnt, NULL);
+    LAGraph_Free((void **)&starts, NULL);
+    LAGraph_Free((void **)&curr_pos, NULL);
+    LAGraph_Free((void **)&pairs, NULL);
     return info;
 }
 
@@ -847,16 +989,9 @@ static GrB_Info k_conv_all(GrB_Matrix *res, const pat_args *a) {
                     keep = true;
                     incremental_success = true;
                 } else {
-                    GrB_Matrix Cay_new = NULL;
-                    GrB_Index nr, nc;
-                    PAT_TRY(GrB_Matrix_nrows(&nr, slot->matrix));
-                    PAT_TRY(GrB_Matrix_ncols(&nc, slot->matrix));
-                    PAT_TRY(GrB_Matrix_new(&Cay_new, GrB_BOOL, nr, nc));
-                    PAT_TRY(GrB_eWiseAdd(Cay_new, GrB_NULL, GrB_NULL, GrB_LOR,
-                                        slot->matrix, slot->cay_delta, GrB_NULL));
+                    PAT_TRY(GrB_eWiseAdd(slot->matrix, GrB_NULL, GrB_NULL, GrB_LOR,
+                            slot->matrix, slot->cay_delta, GrB_NULL));
 
-                    GrB_free(&slot->matrix);
-                    slot->matrix = Cay_new;
                     slot->owner_nvals = ownerB_nv;
 
                     GrB_free(&slot->cay_delta);
