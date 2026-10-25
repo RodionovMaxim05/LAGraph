@@ -31,7 +31,7 @@ static void make_empty_elem(AllPathsElem *z, const bool *x) {
     z->n = 0;
     z->data.single_elem.mid = GrB_INDEX_MAX;
     z->data.single_elem.rule_count = 0;
-    z->data.single_elem.rule_id0 = -1;
+    z->data.single_elem.rule_id0 = UINT32_MAX;
     z->data.single_elem.rest.rule_ids_rest = NULL;
 }
 
@@ -39,7 +39,7 @@ static void make_empty_elem(AllPathsElem *z, const bool *x) {
 static void mult_all_paths_post(AllPathsElem *z, const void *x, GrB_Index ix,
                                 GrB_Index jx, const void *y, GrB_Index iy, GrB_Index jy,
                                 const void *theta) {
-    int32_t rule_id = *(const int32_t *)theta;
+    uint32_t rule_id = *(const uint32_t *)theta;
     z->data.single_elem.mid = jx;
     z->data.single_elem.rule_count = 1;
     z->data.single_elem.rule_id0 = rule_id;
@@ -53,7 +53,7 @@ static void set_all_paths(AllPathsElem *z, const AllPathsElem *x,
     z->data.single_elem.mid = GrB_INDEX_MAX; // A special value to indicate that this path corresponds to a
                                              // terminal rule (A->t) or an epsilon rule (A->eps)
     z->data.single_elem.rule_count = 0;
-    z->data.single_elem.rule_id0 = -1;
+    z->data.single_elem.rule_id0 = UINT32_MAX;
     z->data.single_elem.rest.rule_ids_rest = NULL;
     z->n = 1;
 }
@@ -64,7 +64,7 @@ static void set_all_paths(AllPathsElem *z, const AllPathsElem *x,
     "                     const void *y, GrB_Index iy, GrB_Index jy, \n"                 \
     "                     const void *theta) \n"                                         \
     "{ \n"                                                                               \
-    "  int32_t rule_id = *(const int32_t *)theta; \n"                                    \
+    "  uint32_t rule_id = *(const uint32_t *)theta; \n"                                  \
     "  z->data.single_elem.mid = jx; \n"                                                 \
     "  z->data.single_elem.rule_count = 1; \n"                                           \
     "  z->data.single_elem.rule_id0 = rule_id; \n"                                       \
@@ -82,10 +82,10 @@ static void set_all_paths(AllPathsElem *z, const AllPathsElem *x,
         if (outputs_reachability[(cur_pB)] != NULL)                                      \
             GrB_Matrix_nvals(&nnz_pB, outputs_reachability[(cur_pB)]);                   \
         if (nnz_A > 0 && nnz_pA > 0 && nnz_pB > 0) {                                     \
-            int32_t this_rule_id = (int32_t)rule_table_count;                            \
+            uint32_t this_rule_id = (uint32_t)rule_table_count;                          \
             LG_TRY(rule_table_push(&rule_table, &rule_table_count, &rule_table_cap,      \
                                    (cur_A), (cur_pA), (cur_pB)));                        \
-            GRB_TRY(GrB_Scalar_setElement_INT32(rule_theta, this_rule_id));              \
+            GRB_TRY(GrB_Scalar_setElement_UINT32(rule_theta, this_rule_id));             \
             GrB_BinaryOp rule_mult;                                                      \
             GRB_TRY(GxB_BinaryOp_new_IndexOp(&rule_mult, IAllPaths_mult, rule_theta));   \
             GrB_Semiring rule_semiring;                                                  \
@@ -144,8 +144,8 @@ GrB_Info LAGraph_CFL_AllPaths_adv(GrB_Matrix *outputs, GrB_Type *all_paths_ptr_t
     GrB_free(all_paths_ptr_t);
     GRB_TRY(
         GxB_Type_new(all_paths_ptr_t, sizeof(AllPathsElem), "AllPathsElem",
-                     "typedef struct{GrB_Index mid;uint32_t rule_count;int32_t rule_id0;"
-                     "union{int32_t inline_ids[2];int32_t* rule_ids_rest;}rest;}MidEntry;"
+                     "typedef struct{GrB_Index mid;uint32_t rule_count;uint32_t rule_id0;"
+                     "union{uint32_t inline_ids[2];uint32_t* rule_ids_rest;}rest;}MidEntry;"
                      "typedef struct{size_t n;union{MidEntry single_elem;"
                      "MidEntry* middle;}data;}"
                      "AllPathsElem;"));
@@ -157,7 +157,7 @@ GrB_Info LAGraph_CFL_AllPaths_adv(GrB_Matrix *outputs, GrB_Type *all_paths_ptr_t
     GRB_TRY(GrB_Monoid_new(&AllPaths_monoid, AllPaths_add, (void *)(&bottom)));
 
     GRB_TRY(GxB_IndexBinaryOp_new(&IAllPaths_mult, (void *)mult_all_paths_post,
-                                  AllPaths_type, GrB_BOOL, GrB_BOOL, GrB_INT32,
+                                  AllPaths_type, GrB_BOOL, GrB_BOOL, GrB_UINT32,
                                   "mult_all_paths_post", MULT_PATH_POST_INDEX_DEFN));
 
     GRB_TRY(GrB_UnaryOp_new(&make_empty_elem_op, (void *)make_empty_elem, AllPaths_type, GrB_BOOL));
@@ -296,7 +296,7 @@ GrB_Info LAGraph_CFL_AllPaths_adv(GrB_Matrix *outputs, GrB_Type *all_paths_ptr_t
         GrB_free(&identity_matrix);
     }
 
-    GRB_TRY(GrB_Scalar_new(&rule_theta, GrB_INT32));
+    GRB_TRY(GrB_Scalar_new(&rule_theta, GrB_UINT32));
 
     for (size_t i = 0; i < bin_rules_count; i++) {
         LAGraph_rule_EWCNF bin_rule = new_rules[bin_rules[i]];
@@ -398,11 +398,11 @@ GrB_Info LAGraph_CFL_AllPaths_adv(GrB_Matrix *outputs, GrB_Type *all_paths_ptr_t
         if (nnz_pA == 0 || nnz_pB == 0)
             continue;
 
-        int32_t this_rule_id = (int32_t)rule_table_count;
+        uint32_t this_rule_id = (uint32_t)rule_table_count;
         LG_TRY(rule_table_push(&rule_table, &rule_table_count, &rule_table_cap,
                         bin_rule.nonterm, bin_rule.prod_A, bin_rule.prod_B));
 
-        GRB_TRY(GrB_Scalar_setElement_INT32(rule_theta, this_rule_id));
+        GRB_TRY(GrB_Scalar_setElement_UINT32(rule_theta, this_rule_id));
 
         GrB_BinaryOp rule_mult;
         GRB_TRY(GxB_BinaryOp_new_IndexOp(&rule_mult, IAllPaths_mult, rule_theta));

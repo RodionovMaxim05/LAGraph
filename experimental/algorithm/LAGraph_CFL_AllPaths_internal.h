@@ -10,7 +10,7 @@ static inline bool mid_entry_uses_heap(const MidEntry *e) {
 }
 
 // Retrieves the k-th additional rule ID from either inline array or heap allocation
-static inline int32_t mid_entry_rest_id(const MidEntry *e, uint32_t k) {
+static inline uint32_t mid_entry_rest_id(const MidEntry *e, uint32_t k) {
     if (mid_entry_uses_heap(e)) {
         return e->rest.rule_ids_rest[k];
     }
@@ -29,7 +29,7 @@ static inline void free_mid_entry_contents(MidEntry *entry) {
 
 // Adds a rule ID to MidEntry, avoiding duplicates and transitioning to heap allocation
 // when inline capacity is exceeded
-static void mid_entry_add_rule(MidEntry *e, int32_t rule_id) {
+static void mid_entry_add_rule(MidEntry *e, uint32_t rule_id) {
     if (e->rule_count == 0) {
         e->rule_id0 = rule_id;
         e->rule_count = 1;
@@ -53,8 +53,8 @@ static void mid_entry_add_rule(MidEntry *e, int32_t rule_id) {
         }
 
         // Allocate heap memory when inline capacity is exceeded
-        int32_t *heap = malloc((extra + 1) * sizeof(int32_t));
-        memcpy(heap, e->rest.inline_ids, extra * sizeof(int32_t));
+        uint32_t *heap = malloc((extra + 1) * sizeof(uint32_t));
+        memcpy(heap, e->rest.inline_ids, extra * sizeof(uint32_t));
         heap[extra] = rule_id;
         e->rest.rule_ids_rest = heap;
         e->rule_count++;
@@ -66,7 +66,7 @@ static void mid_entry_add_rule(MidEntry *e, int32_t rule_id) {
             return;
     }
 
-    int32_t *tmp = realloc(e->rest.rule_ids_rest, (extra + 1) * sizeof(int32_t));
+    uint32_t *tmp = realloc(e->rest.rule_ids_rest, (extra + 1) * sizeof(uint32_t));
     tmp[extra] = rule_id;
     e->rest.rule_ids_rest = tmp;
     e->rule_count++;
@@ -183,7 +183,7 @@ static void insert_all_paths(AllPathsElem *elem, MidEntry *value) {
 
 // Merging two ordered arrays of MidEntry intermediate vertices in the add function
 static MidEntry *merge_all_paths(size_t *out_n, MidEntry *a, size_t na,
-                                        MidEntry *b, size_t nb) {
+                                 MidEntry *b, size_t nb) {
     size_t alloc_cap = na + nb;
     MidEntry *tmp = alloc_middle(alloc_cap);
     size_t ia = 0, ib = 0, outn = 0;

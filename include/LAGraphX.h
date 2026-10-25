@@ -1106,12 +1106,12 @@ GrB_Info LAGraph_CFPQ_core
 // Intermediate vertex entry storing derivation rule provenance and middle node index
 typedef struct
 {
-    GrB_Index mid;                                // Intermediate vertex index
-    uint32_t rule_count;                          // Total count of associated rule IDs
-    int32_t rule_id0;                             // Primary rule ID (-1 if unassigned)
+    GrB_Index mid;                                 // Intermediate vertex index
+    uint32_t rule_count;                           // Total count of associated rule IDs
+    uint32_t rule_id0;                             // Primary rule ID (UINT32_MAX if unassigned)
     union {
-        int32_t inline_ids[MID_ENTRY_INLINE_CAP]; // Inline storage for small rule sets
-        int32_t *rule_ids_rest;                   // Dynamic heap array for additional rule IDs
+        uint32_t inline_ids[MID_ENTRY_INLINE_CAP]; // Inline storage for small rule sets
+        uint32_t *rule_ids_rest;                   // Dynamic heap array for additional rule IDs
     } rest;
 } MidEntry;
 
