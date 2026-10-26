@@ -1100,29 +1100,13 @@ GrB_Info LAGraph_CFPQ_core
     char *msg // Message string for error reporting.
 );
 
-// Capacity limit for inline rule ID storage before falling back to heap allocation
-#define MID_ENTRY_INLINE_CAP 2
-
-// Intermediate vertex entry storing derivation rule provenance and middle node index
 typedef struct
 {
-    GrB_Index mid;                                 // Intermediate vertex index
-    uint32_t rule_count;                           // Total count of associated rule IDs
-    uint32_t rule_id0;                             // Primary rule ID (UINT32_MAX if unassigned)
-    union {
-        uint32_t inline_ids[MID_ENTRY_INLINE_CAP]; // Inline storage for small rule sets
-        uint32_t *rule_ids_rest;                   // Dynamic heap array for additional rule IDs
-    } rest;
-} MidEntry;
-
-// Type element representing path derivation sets in matrices
-typedef struct
-{
-    size_t n;                 // Number of intermediate vertex entries (0 = empty, 1 = single_elem, >1 = middle)
+    size_t n;
     union
     {
-        MidEntry single_elem; // Direct element storage for a single path entry
-        MidEntry *middle;     // Dynamic ordered array of path entries for multiple paths
+        GrB_Index single_elem;
+        GrB_Index* middle;
     } data;
 } AllPathsElem;
 
@@ -1151,7 +1135,6 @@ GrB_Info LAGraph_CFL_AllPaths(
                          // GrB_INDEX_MAX in the array is a special value for A->eps and A->t.
     // AllPaths type - elements of the output matrices.
     GrB_Type *all_paths_ptr_t,      // Pass a pointer to GrB_Type.
-    BinaryRuleInfo **out_rule_table, // Pointer to store output binary rule metadata table.
     // Input
     const GrB_Matrix *adj_matrices, // Array of adjacency matrices representing the graph.
                                     // The length of this array is equal to the count of
@@ -1813,7 +1796,6 @@ GrB_Info LAGraph_CFL_reachability_adv
 GrB_Info LAGraph_CFL_AllPaths_adv(
     GrB_Matrix *outputs,
     GrB_Type *all_paths_ptr_t,
-    BinaryRuleInfo **out_rule_table,
     const GrB_Matrix *adj_matrices,
     size_t symbols_amount,
     const LAGraph_rule_EWCNF *rules,
