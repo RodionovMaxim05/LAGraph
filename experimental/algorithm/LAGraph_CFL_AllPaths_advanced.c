@@ -19,6 +19,7 @@
         GrB_free(&IAllPaths_mult);                                                       \
         GrB_free(&AllPaths_mult);                                                        \
         GrB_free(&AllPaths_add);                                                         \
+        GrB_free(&make_empty_elem_op);                                                   \
         GrB_free(&Theta);                                                                \
         GrB_free(&desc_s);                                                               \
     }
@@ -118,10 +119,18 @@ static GrB_Index *insert_all_paths(size_t *n, GrB_Index *arr, const size_t len,
 
 static void add_all_paths(AllPathsElem *z, AllPathsElem *x, AllPathsElem *y)
 {
+    if (x->n == 0) {
+        *z = *y;
+        return;
+    }
+    if (y->n == 0) {
+        *z = *x;
+        return;
+    }
+
     // temp is needed to avoid freeing the memory of z in case z == x or z == y
     AllPathsElem temp;
 
-    // x->n and y->n are not equal to zero
     if (x->n == 1 && y->n == 1) {
         if (x->data.single_elem == y->data.single_elem) {
             temp.n = 1;
@@ -164,6 +173,11 @@ static void set_all_paths(AllPathsElem *z, const AllPathsElem *x, const bool *ed
     z->data.single_elem = GrB_INDEX_MAX; // Special value indicating terminal (A->t) or
                                          // epsilon (A->eps) rule
     z->n = 1;
+}
+
+static void make_empty_elem(AllPathsElem *z, const bool *x) {
+    z->data.single_elem = GrB_INDEX_MAX;
+    z->n = 0;
 }
 
 #define MULT_PATH_POST_INDEX_DEFN                                                        \
@@ -227,6 +241,7 @@ GrB_Info LAGraph_CFL_AllPaths_adv(
     size_t *bin_rules = NULL, bin_rules_count = 0;
     GrB_Matrix identity_matrix = NULL;
     GrB_Vector v_diag = NULL;
+    GrB_UnaryOp make_empty_elem_op = NULL;
 
 #if GxB_IMPLEMENTATION < GxB_VERSION(9, 4, 5)
     return (GrB_NOT_IMPLEMENTED);
@@ -247,6 +262,7 @@ GrB_Info LAGraph_CFL_AllPaths_adv(
         "GrB_Index* middle;}data;}AllPathsElem;"));
     AllPaths_type = *all_paths_ptr_t;
 
+    GRB_TRY(GrB_UnaryOp_new(&make_empty_elem_op, (void *)make_empty_elem, AllPaths_type, GrB_BOOL));
     GRB_TRY(GrB_Scalar_new(&Theta, GrB_BOOL));
     GRB_TRY(GrB_Scalar_setElement_BOOL(Theta, false));
 
@@ -336,6 +352,14 @@ GrB_Info LAGraph_CFL_AllPaths_adv(
 
     for (size_t i = 0; i < symbols_amount; i++) {
         GRB_TRY(GrB_Matrix_new(&T[i], AllPaths_type, n, n));
+        GrB_Index r_nnz = 0;
+        if (outputs_reachability[i] != NULL) {
+            GRB_TRY(GrB_Matrix_nvals(&r_nnz, outputs_reachability[i]));
+            if (r_nnz > 0) {
+                GRB_TRY(GrB_apply(T[i], GrB_NULL, GrB_NULL, make_empty_elem_op,
+                                outputs_reachability[i], GrB_NULL));
+            }
+        }
     }
 
     LG_TRY(LAGraph_Calloc((void **)&eps_rules, new_rules_count, sizeof(size_t), msg));
