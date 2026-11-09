@@ -3,10 +3,12 @@
 // in at least one Context-Free Language (CFL) derivation for selected pair sets.
 //
 // Key Optimizations:
-//  - Frontier grouping by BFS levels.
-//  - Radix sorting of level elements by (A, i, j) in O(|F|) time.
+//  - De-multiplexed Frontier by non-terminal symbol A (CFL_Frontier).
+//  - 16-byte state items {i, j} with 64-bit GrB_Index.
+//  - 11-bit LSD Radix Sort with bitwise mask-based pass skipping (OR ^ AND).
+//  - Hybrid fallback to qsort for small frontiers (n < 512).
 //  - Merging F = {j_1 < j_2 < ... < j_m} with rows of matrices B, C and adj[a]
-// using cfl_gallop.
+// using cfl_gallop_search.
 //  - Zero-copy HyperCSR unpack without GrB_Matrix_dup, qsort, or dense row
 // offsets.
 //  - Usage of PathsView (bucket index), RowPresence, and visited bitsets.
@@ -25,6 +27,11 @@
 
 // Maximum range size threshold for switching from binary search to linear scan.
 #define BINARY_SEARCH_THRESHOLD 8
+
+// Radix sort parameters for vertex pair queue sorting.
+#define RADIX_BITS 11
+#define RADIX_SIZE (1u << RADIX_BITS)
+#define SORT_SMALL 512
 
 #define LG_FREE_WORK                                                                     \
     do {                                                                                 \
@@ -51,6 +58,25 @@ typedef struct {
     int32_t A; // Left-hand side symbol
     int32_t a; // Right-hand terminal symbol
 } CFL_TermRule;
+
+// Represents a pair of vertex indices (i, j) in graph traversal
+typedef struct {
+    GrB_Index src_node;
+    GrB_Index dst_node;
+} CFL_VertexPair;
+
+// Dynamic queue for vertex pairs associated with a specific nonterminal symbol
+typedef struct {
+    CFL_VertexPair *v;
+    size_t n, cap;
+} CFL_PairQueue;
+
+// De-multiplexed BFS frontier holding pair queues for all nonterminals
+typedef struct {
+    CFL_PairQueue *q;    // Array of pair queues [symbols_amount]
+    int32_t *active;     // Nonterminals with non-empty queues at current BFS level
+    size_t active_count; // Number of active nonterminals
+} CFL_Frontier;
 
 // Resolves pattern role IDs based on mask, rows, columns, and index offsets.
 static inline int32_t pat_role_id(const LAGraph_Pat_role *role, int64_t mask,
@@ -133,26 +159,26 @@ typedef struct {
 } TermIndex;
 
 typedef struct {
-    int32_t A;
-    GrB_Index i, j;
-    GrB_Index pos;
-} CFL_State;
-
-typedef struct {
-    CFL_State *v;
-    size_t n, cap;
-} CFL_StateQueue;
-
-typedef struct {
     GrB_Index *rows;
     GrB_Index *cols;
     size_t n;
     size_t cap;
 } CFL_EdgeBuffer;
 
-// Galloping (exponential search) helper to efficiently find elements in sorted arrays.
-static inline GrB_Index cfl_gallop(const GrB_Index *arr, GrB_Index pos, GrB_Index len,
-                                   GrB_Index target_val) {
+static inline size_t cfl_grow_capacity(size_t current_cap, size_t min_needed) {
+    if (current_cap == 0) {
+        return min_needed > 256 ? min_needed : 256;
+    }
+    size_t new_cap = current_cap + (current_cap >> 1); // Grow by factor of 1.5
+    if (new_cap < min_needed) {
+        new_cap = min_needed;
+    }
+    return new_cap;
+}
+
+// Exponential search (galloping search) helper to locate elements in sorted arrays.
+static inline GrB_Index cfl_gallop_search(const GrB_Index *arr, GrB_Index pos,
+                                          GrB_Index len, GrB_Index target_val) {
     if (pos >= len || arr[pos] >= target_val) {
         return pos;
     }
@@ -174,134 +200,153 @@ static inline GrB_Index cfl_gallop(const GrB_Index *arr, GrB_Index pos, GrB_Inde
     return low;
 }
 
-static GrB_Info cfl_queue_push(CFL_StateQueue *q, CFL_State s) {
+static inline GrB_Info cfl_pair_queue_push(CFL_PairQueue *q, CFL_VertexPair pair) {
     if (q->n == q->cap) {
-        size_t nc = q->cap ? q->cap * 2 : 1024;
-        if (nc < q->cap || nc > SIZE_MAX / sizeof(CFL_State)) {
+        size_t nc = cfl_grow_capacity(q->cap, q->n + 1);
+        if (nc < q->cap || nc > SIZE_MAX / sizeof(CFL_VertexPair)) {
             return GrB_OUT_OF_MEMORY;
         }
-        CFL_State *p = realloc(q->v, nc * sizeof(CFL_State));
+        CFL_VertexPair *p = realloc(q->v, nc * sizeof(CFL_VertexPair));
         if (!p) {
             return GrB_OUT_OF_MEMORY;
         }
         q->v = p;
         q->cap = nc;
     }
-    q->v[q->n++] = s;
+    q->v[q->n++] = pair;
     return GrB_SUCCESS;
 }
 
-// LST-based radix sort for CFL states sorted by keys j, i, and A to optimize memory
-// access patterns.
-static GrB_Info cfl_radix_sort_states(CFL_StateQueue *q, CFL_StateQueue *tmp_q) {
+static int cfl_compare_vertex_pairs(const void *a, const void *b) {
+    const CFL_VertexPair *x = (const CFL_VertexPair *)a;
+    const CFL_VertexPair *y = (const CFL_VertexPair *)b;
+    if (x->src_node != y->src_node) {
+        return x->src_node < y->src_node ? -1 : 1;
+    }
+    return (x->dst_node > y->dst_node) - (x->dst_node < y->dst_node);
+}
+
+// Hybrid LSD radix and quicksort routine for pair queues.
+static GrB_Info cfl_sort_pair_queue(CFL_PairQueue *q, CFL_PairQueue *tmp) {
     size_t n = q->n;
     if (n <= 1) {
         return GrB_SUCCESS;
     }
+    if (n < SORT_SMALL) {
+        qsort(q->v, n, sizeof(CFL_VertexPair), cfl_compare_vertex_pairs);
+        return GrB_SUCCESS;
+    }
 
-    if (tmp_q->cap < n) {
-        CFL_State *p = realloc(tmp_q->v, n * sizeof(CFL_State));
+    GrB_Index or_src = 0, and_src = ~(GrB_Index)0;
+    GrB_Index or_dst = 0, and_dst = ~(GrB_Index)0;
+    for (size_t k = 0; k < n; k++) {
+        or_src |= q->v[k].src_node;
+        and_src &= q->v[k].src_node;
+        or_dst |= q->v[k].dst_node;
+        and_dst &= q->v[k].dst_node;
+    }
+
+    GrB_Index diff[2] = {or_dst ^ and_dst,
+                         or_src ^ and_src}; // 0 = dst_node, 1 = src_node
+    if (tmp->cap < n) {
+        CFL_VertexPair *p = realloc(tmp->v, n * sizeof(CFL_VertexPair));
         if (!p) {
             return GrB_OUT_OF_MEMORY;
         }
-        tmp_q->v = p;
-        tmp_q->cap = n;
+        tmp->v = p;
+        tmp->cap = n;
     }
 
-    GrB_Index max_j = 0, max_i = 0;
-    uint32_t max_A = 0;
-    for (size_t k = 0; k < n; k++) {
-        if (q->v[k].j > max_j) {
-            max_j = q->v[k].j;
-        }
-        if (q->v[k].i > max_i) {
-            max_i = q->v[k].i;
-        }
-        if ((uint32_t)q->v[k].A > max_A) {
-            max_A = (uint32_t)q->v[k].A;
-        }
-    }
+    CFL_VertexPair *src = q->v;
+    CFL_VertexPair *dst = tmp->v;
 
-    CFL_State *src = q->v;
-    CFL_State *dst = tmp_q->v;
+    for (int pass = 0; pass < 2; pass++) {
+        const bool sortBySrc = (pass == 1);
+        GrB_Index diff_bit = diff[pass];
+        if (diff_bit == 0) {
+            continue;
+        }
 
-    // 1. Sort by col (j)
-    for (int shift = 0;; shift += 8) {
-        size_t count[256] = {0};
-        for (size_t k = 0; k < n; k++) {
-            uint8_t b = (uint8_t)((src[k].j >> shift) & 0xFF);
-            count[b]++;
+        unsigned shifts[64 / RADIX_BITS + 1];
+        size_t num_shifts = 0;
+        for (unsigned sh = 0; sh < 64; sh += RADIX_BITS) {
+            if (((diff_bit >> sh) & (RADIX_SIZE - 1)) != 0) {
+                shifts[num_shifts++] = sh;
+            }
         }
-        size_t pos[256];
-        pos[0] = 0;
-        for (int b = 1; b < 256; b++) {
-            pos[b] = pos[b - 1] + count[b - 1];
+        if (num_shifts == 0) {
+            continue;
         }
-        for (size_t k = 0; k < n; k++) {
-            uint8_t b = (uint8_t)((src[k].j >> shift) & 0xFF);
-            dst[pos[b]++] = src[k];
-        }
-        CFL_State *t = src;
-        src = dst;
-        dst = t;
-        if ((max_j >> (shift + 8)) == 0) {
-            break;
-        }
-    }
 
-    // 2. Sort by row (i)
-    for (int shift = 0;; shift += 8) {
-        size_t count[256] = {0};
-        for (size_t k = 0; k < n; k++) {
-            uint8_t b = (uint8_t)((src[k].i >> shift) & 0xFF);
-            count[b]++;
-        }
-        size_t pos[256];
-        pos[0] = 0;
-        for (int b = 1; b < 256; b++) {
-            pos[b] = pos[b - 1] + count[b - 1];
-        }
-        for (size_t k = 0; k < n; k++) {
-            uint8_t b = (uint8_t)((src[k].i >> shift) & 0xFF);
-            dst[pos[b]++] = src[k];
-        }
-        CFL_State *t = src;
-        src = dst;
-        dst = t;
-        if ((max_i >> (shift + 8)) == 0) {
-            break;
-        }
-    }
+        size_t hist[num_shifts][RADIX_SIZE];
+        memset(hist, 0, num_shifts * RADIX_SIZE * sizeof(size_t));
 
-    // 3. Sort by head nonterminal (A)
-    for (int shift = 0;; shift += 8) {
-        size_t count[256] = {0};
         for (size_t k = 0; k < n; k++) {
-            uint8_t b = (uint8_t)((((uint32_t)src[k].A) >> shift) & 0xFF);
-            count[b]++;
+            GrB_Index val = sortBySrc ? src[k].src_node : src[k].dst_node;
+            for (size_t s = 0; s < num_shifts; s++) {
+                hist[s][(val >> shifts[s]) & (RADIX_SIZE - 1)]++;
+            }
         }
-        size_t pos[256];
-        pos[0] = 0;
-        for (int b = 1; b < 256; b++) {
-            pos[b] = pos[b - 1] + count[b - 1];
-        }
-        for (size_t k = 0; k < n; k++) {
-            uint8_t b = (uint8_t)((((uint32_t)src[k].A) >> shift) & 0xFF);
-            dst[pos[b]++] = src[k];
-        }
-        CFL_State *t = src;
-        src = dst;
-        dst = t;
-        if ((max_A >> (shift + 8)) == 0) {
-            break;
+
+        for (size_t s = 0; s < num_shifts; s++) {
+            unsigned sh = shifts[s];
+            size_t *cnt = hist[s];
+
+            size_t sum = 0;
+            for (unsigned b = 0; b < RADIX_SIZE; b++) {
+                size_t c = cnt[b];
+                cnt[b] = sum;
+                sum += c;
+            }
+
+            for (size_t k = 0; k < n; k++) {
+                GrB_Index val = sortBySrc ? src[k].src_node : src[k].dst_node;
+                dst[cnt[(val >> sh) & (RADIX_SIZE - 1)]++] = src[k];
+            }
+
+            CFL_VertexPair *temp = src;
+            src = dst;
+            dst = temp;
         }
     }
 
     if (src != q->v) {
-        memcpy(q->v, tmp_q->v, n * sizeof(CFL_State));
-    }
+        CFL_VertexPair *tmp_p = q->v;
+        size_t tmp_c = q->cap;
 
+        q->v = tmp->v;
+        q->cap = tmp->cap;
+
+        tmp->v = tmp_p;
+        tmp->cap = tmp_c;
+    }
     return GrB_SUCCESS;
+}
+
+static GrB_Info cfl_frontier_init(CFL_Frontier *F, size_t symbols_amount) {
+    memset(F, 0, sizeof(*F));
+    F->q = calloc(symbols_amount, sizeof(CFL_PairQueue));
+    F->active = malloc(symbols_amount * sizeof(int32_t));
+    if (!F->q || !F->active) {
+        free(F->q);
+        free(F->active);
+        memset(F, 0, sizeof(*F));
+        return GrB_OUT_OF_MEMORY;
+    }
+    return GrB_SUCCESS;
+}
+
+static void cfl_frontier_free(CFL_Frontier *F, size_t symbols_amount) {
+    if (!F)
+        return;
+    if (F->q) {
+        for (size_t a = 0; a < symbols_amount; a++) {
+            free(F->q[a].v);
+        }
+        free(F->q);
+    }
+    free(F->active);
+    memset(F, 0, sizeof(*F));
 }
 
 static GrB_Info paths_view_close(PathsView *v) {
@@ -487,8 +532,10 @@ static inline bool cfl_bit_test_and_set(uint64_t *visited, GrB_Index p) {
     return old;
 }
 
-static inline GrB_Info cfl_claim(PathsView *fast_paths, int32_t A, GrB_Index i,
-                                 GrB_Index j, GrB_Index pos, CFL_StateQueue *q) {
+// Claims a pair (i, j) for symbol processing if not previously visited.
+static inline GrB_Info cfl_frontier_claim_pair(PathsView *fast_paths, int32_t A,
+                                               GrB_Index i, GrB_Index j, GrB_Index pos,
+                                               CFL_Frontier *F) {
     PathsView *v = &fast_paths[A];
     if (!v->open || pos >= v->nnz || !v->visited) {
         return GrB_INVALID_INDEX;
@@ -496,7 +543,12 @@ static inline GrB_Info cfl_claim(PathsView *fast_paths, int32_t A, GrB_Index i,
     if (cfl_bit_test_and_set(v->visited, pos)) {
         return GrB_SUCCESS;
     }
-    return cfl_queue_push(q, (CFL_State){A, i, j, pos});
+
+    CFL_PairQueue *queue = &F->q[A];
+    if (queue->n == 0) {
+        F->active[F->active_count++] = A;
+    }
+    return cfl_pair_queue_push(queue, (CFL_VertexPair){i, j});
 }
 
 static GrB_Info init_row_presence(RowPresence *rp, const PathsView *fast_paths,
@@ -550,7 +602,7 @@ static void free_row_presence(RowPresence *rp) {
     memset(rp, 0, sizeof(*rp));
 }
 
-static int compare_bin_rules_by_B(const void *pa, const void *pb) {
+static int cfl_compare_binary_rules(const void *pa, const void *pb) {
     const BinRule *a = pa;
     const BinRule *b = pb;
     if (a->B != b->B) {
@@ -613,7 +665,7 @@ static GrB_Info build_binary_index(BinaryIndex *bi, const CFL_triple *triples,
         bi->offset[a] = write_pos;
 
         if (count > 0) {
-            qsort(&bi->rules[start], count, sizeof(BinRule), compare_bin_rules_by_B);
+            qsort(&bi->rules[start], count, sizeof(BinRule), cfl_compare_binary_rules);
 
             bi->rules[write_pos++] = bi->rules[start];
             for (size_t i = 1; i < count; i++) {
@@ -721,7 +773,7 @@ static void free_term_index(TermIndex *ti) {
 
 static GrB_Info cfl_edge_append(CFL_EdgeBuffer *b, GrB_Index i, GrB_Index j) {
     if (b->n == b->cap) {
-        size_t nc = b->cap ? b->cap * 2 : 256;
+        size_t nc = cfl_grow_capacity(b->cap, b->n + 1);
         if (nc < b->cap || nc > SIZE_MAX / sizeof(GrB_Index)) {
             return GrB_OUT_OF_MEMORY;
         }
@@ -783,10 +835,11 @@ static GrB_Info extract_edges_worklist(GrB_Matrix *edges, const GrB_Matrix *R,
     RowPresence rp = {0};
     BinaryIndex bin_idx = {0};
     TermIndex term_idx = {0};
-    CFL_StateQueue q_curr = {0}, q_next = {0}, q_tmp = {0};
-    GrB_Index *js_buf = NULL;
-    size_t js_cap = 0;
-    GrB_Index *rows = NULL, *cols = NULL;
+    CFL_Frontier cur = {0}, next = {0};
+    CFL_PairQueue tmp_sort_queue = {0};
+    GrB_Index *target_cols_buffer = NULL;
+    size_t target_cols_cap = 0;
+    GrB_Index *pair_rows = NULL, *pair_cols = NULL;
     bool *pair_vals = NULL;
     GrB_Index nz = 0;
 
@@ -799,6 +852,16 @@ static GrB_Info extract_edges_worklist(GrB_Matrix *edges, const GrB_Matrix *R,
     eb = calloc(symbols_amount, sizeof(*eb));
     if (!fast_paths || !adj_views || !eb) {
         info = GrB_OUT_OF_MEMORY;
+        goto cleanup;
+    }
+
+    info = cfl_frontier_init(&cur, symbols_amount);
+    if (info != GrB_SUCCESS) {
+        goto cleanup;
+    }
+
+    info = cfl_frontier_init(&next, symbols_amount);
+    if (info != GrB_SUCCESS) {
         goto cleanup;
     }
 
@@ -846,8 +909,8 @@ static GrB_Info extract_edges_worklist(GrB_Matrix *edges, const GrB_Matrix *R,
                     if (i == j) {
                         continue;
                     }
-                    info =
-                        cfl_claim(fast_paths, (int32_t)start_nonterm, i, j, pos, &q_curr);
+                    info = cfl_frontier_claim_pair(fast_paths, (int32_t)start_nonterm, i,
+                                                   j, pos, &cur);
                     if (info != GrB_SUCCESS) {
                         goto cleanup;
                     }
@@ -860,26 +923,26 @@ static GrB_Info extract_edges_worklist(GrB_Matrix *edges, const GrB_Matrix *R,
             goto cleanup;
         }
 
-        rows = malloc((size_t)(nz ? nz : 1) * sizeof(GrB_Index));
-        cols = malloc((size_t)(nz ? nz : 1) * sizeof(GrB_Index));
+        pair_rows = malloc((size_t)(nz ? nz : 1) * sizeof(GrB_Index));
+        pair_cols = malloc((size_t)(nz ? nz : 1) * sizeof(GrB_Index));
         pair_vals = malloc((size_t)(nz ? nz : 1) * sizeof(bool));
-        if (!rows || !cols || !pair_vals) {
+        if (!pair_rows || !pair_cols || !pair_vals) {
             info = GrB_OUT_OF_MEMORY;
             goto cleanup;
         }
 
-        info = GrB_Matrix_extractTuples_BOOL(rows, cols, pair_vals, &nz, pairs);
+        info = GrB_Matrix_extractTuples_BOOL(pair_rows, pair_cols, pair_vals, &nz, pairs);
         if (info != GrB_SUCCESS) {
             goto cleanup;
         }
 
         PathsView *s = &fast_paths[start_nonterm];
         for (GrB_Index z = 0; z < nz; z++) {
-            if (pair_vals[z] && rows[z] < n && cols[z] < n) {
+            if (pair_vals[z] && pair_rows[z] < n && pair_cols[z] < n) {
                 GrB_Index pos;
-                if (paths_view_find_elem(s, rows[z], cols[z], &pos)) {
-                    info = cfl_claim(fast_paths, (int32_t)start_nonterm, rows[z], cols[z],
-                                     pos, &q_curr);
+                if (paths_view_find_elem(s, pair_rows[z], pair_cols[z], &pos)) {
+                    info = cfl_frontier_claim_pair(fast_paths, (int32_t)start_nonterm,
+                                                   pair_rows[z], pair_cols[z], pos, &cur);
                     if (info != GrB_SUCCESS) {
                         goto cleanup;
                     }
@@ -889,137 +952,147 @@ static GrB_Info extract_edges_worklist(GrB_Matrix *edges, const GrB_Matrix *R,
     }
 
     // Level-by-level processing of the frontier (BFS loop)
-    while (q_curr.n > 0) {
-        info = cfl_radix_sort_states(&q_curr, &q_tmp);
-        if (info != GrB_SUCCESS) {
-            goto cleanup;
-        }
+    while (cur.active_count > 0) {
+        for (size_t a = 0; a < cur.active_count; a++) {
+            int32_t A = cur.active[a];
+            CFL_PairQueue *qa = &cur.q[A];
 
-        size_t idx = 0;
-        while (idx < q_curr.n) {
-            int32_t A = q_curr.v[idx].A;
-            GrB_Index i = q_curr.v[idx].i;
-
-            size_t end = idx;
-            while (end < q_curr.n && q_curr.v[end].A == A && q_curr.v[end].i == i) {
-                end++;
+            info = cfl_sort_pair_queue(qa, &tmp_sort_queue);
+            if (info != GrB_SUCCESS) {
+                goto cleanup;
             }
 
-            size_t m = end - idx;
-            if (m > js_cap) {
-                size_t ncap = m > 2 * js_cap ? m : 2 * js_cap;
-                GrB_Index *njs = realloc(js_buf, ncap * sizeof(GrB_Index));
-                if (!njs) {
-                    info = GrB_OUT_OF_MEMORY;
-                    goto cleanup;
+            for (size_t idx = 0; idx < qa->n;) {
+                GrB_Index i = qa->v[idx].src_node;
+                size_t end = idx;
+                while (end < qa->n && qa->v[end].src_node == i) {
+                    end++;
                 }
-                js_buf = njs;
-                js_cap = ncap;
-            }
 
-            for (size_t k = 0; k < m; k++) {
-                js_buf[k] = q_curr.v[idx + k].j;
-            }
-
-            // 1. Terminal rules processing for group (A, i) using galloping
-            // intersection
-            size_t t_begin = term_idx.offset[A];
-            size_t t_end = term_idx.offset[A + 1];
-            for (size_t z = t_begin; z < t_end; z++) {
-                int32_t a_sym = term_idx.rules[z].a;
-                PathsView *vTerm = &adj_views[a_sym];
-                GrB_Index lTerm, hTerm;
-                if (paths_view_find_row_range(vTerm, i, &lTerm, &hTerm)) {
-                    size_t a_idx = 0;
-                    GrB_Index q = lTerm;
-                    const GrB_Index *Aj_term = vTerm->Aj;
-                    while (a_idx < m && q < hTerm) {
-                        if (js_buf[a_idx] < Aj_term[q]) {
-                            a_idx = cfl_gallop(js_buf, a_idx, m, Aj_term[q]);
-                        } else if (Aj_term[q] < js_buf[a_idx]) {
-                            q = cfl_gallop(Aj_term, q, hTerm, js_buf[a_idx]);
-                        } else {
-                            info = cfl_edge_append(&eb[a_sym], i, js_buf[a_idx]);
-                            if (info != GrB_SUCCESS) {
-                                goto cleanup;
-                            }
-                            a_idx++;
-                            q++;
-                        }
+                size_t m = end - idx;
+                if (m > target_cols_cap) {
+                    size_t ncap = cfl_grow_capacity(target_cols_cap, m);
+                    GrB_Index *njs =
+                        realloc(target_cols_buffer, ncap * sizeof(GrB_Index));
+                    if (!njs) {
+                        info = GrB_OUT_OF_MEMORY;
+                        goto cleanup;
                     }
-                }
-            }
-
-            // 2. Binary non-terminal rules processing for group (A, i)
-            size_t r_begin = bin_idx.offset[A];
-            size_t r_end = bin_idx.offset[A + 1];
-            size_t r = r_begin;
-
-            while (r < r_end) {
-                int32_t B = bin_idx.rules[r].B;
-                size_t r_b_end = r + 1;
-                while (r_b_end < r_end && bin_idx.rules[r_b_end].B == B) {
-                    r_b_end++;
+                    target_cols_buffer = njs;
+                    target_cols_cap = ncap;
                 }
 
-                if (row_presence_has(&rp, B, i)) {
-                    PathsView *vB = &fast_paths[B];
-                    GrB_Index lB, hB;
-                    if (paths_view_find_row_range(vB, i, &lB, &hB)) {
-                        for (GrB_Index pB = lB; pB < hB; pB++) {
-                            GrB_Index k = vB->Aj[pB];
-                            bool hitB = false;
+                for (size_t k = 0; k < m; k++) {
+                    target_cols_buffer[k] = qa->v[idx + k].dst_node;
+                }
 
-                            for (size_t sub_r = r; sub_r < r_b_end; sub_r++) {
-                                int32_t C = bin_idx.rules[sub_r].C;
-                                PathsView *vC = &fast_paths[C];
-                                GrB_Index lC, hC;
-                                if (!paths_view_find_row_range(vC, k, &lC, &hC)) {
-                                    continue;
-                                }
-
-                                size_t a_idx = 0;
-                                GrB_Index q = lC;
-                                const GrB_Index *Aj_C = vC->Aj;
-
-                                while (a_idx < m && q < hC) {
-                                    if (js_buf[a_idx] < Aj_C[q]) {
-                                        a_idx = cfl_gallop(js_buf, a_idx, m, Aj_C[q]);
-                                    } else if (Aj_C[q] < js_buf[a_idx]) {
-                                        q = cfl_gallop(Aj_C, q, hC, js_buf[a_idx]);
-                                    } else {
-                                        info = cfl_claim(fast_paths, C, k, js_buf[a_idx],
-                                                         q, &q_next);
-                                        if (info != GrB_SUCCESS) {
-                                            goto cleanup;
-                                        }
-                                        hitB = true;
-                                        a_idx++;
-                                        q++;
-                                    }
-                                }
-                            }
-
-                            if (hitB) {
-                                info = cfl_claim(fast_paths, B, i, k, pB, &q_next);
+                // 1. Terminal rules processing for group (A, i) using galloping
+                // intersection
+                size_t t_begin = term_idx.offset[A];
+                size_t t_end = term_idx.offset[A + 1];
+                for (size_t z = t_begin; z < t_end; z++) {
+                    int32_t a_sym = term_idx.rules[z].a;
+                    PathsView *vTerm = &adj_views[a_sym];
+                    GrB_Index lTerm, hTerm;
+                    if (paths_view_find_row_range(vTerm, i, &lTerm, &hTerm)) {
+                        size_t a_idx = 0;
+                        GrB_Index q = lTerm;
+                        const GrB_Index *Aj_term = vTerm->Aj;
+                        while (a_idx < m && q < hTerm) {
+                            if (target_cols_buffer[a_idx] < Aj_term[q]) {
+                                a_idx = cfl_gallop_search(target_cols_buffer, a_idx, m,
+                                                          Aj_term[q]);
+                            } else if (Aj_term[q] < target_cols_buffer[a_idx]) {
+                                q = cfl_gallop_search(Aj_term, q, hTerm,
+                                                      target_cols_buffer[a_idx]);
+                            } else {
+                                info = cfl_edge_append(&eb[a_sym], i,
+                                                       target_cols_buffer[a_idx]);
                                 if (info != GrB_SUCCESS) {
                                     goto cleanup;
                                 }
+                                a_idx++;
+                                q++;
                             }
                         }
                     }
                 }
-                r = r_b_end;
-            }
 
-            idx = end;
+                // 2. Binary non-terminal rules processing for group (A, i)
+                size_t r_begin = bin_idx.offset[A];
+                size_t r_end = bin_idx.offset[A + 1];
+                size_t r = r_begin;
+
+                while (r < r_end) {
+                    int32_t B = bin_idx.rules[r].B;
+                    size_t r_b_end = r + 1;
+                    while (r_b_end < r_end && bin_idx.rules[r_b_end].B == B) {
+                        r_b_end++;
+                    }
+
+                    if (row_presence_has(&rp, B, i)) {
+                        PathsView *vB = &fast_paths[B];
+                        GrB_Index lB, hB;
+                        if (paths_view_find_row_range(vB, i, &lB, &hB)) {
+                            for (GrB_Index pB = lB; pB < hB; pB++) {
+                                GrB_Index k = vB->Aj[pB];
+                                bool hitB = false;
+
+                                for (size_t sub_r = r; sub_r < r_b_end; sub_r++) {
+                                    int32_t C = bin_idx.rules[sub_r].C;
+                                    PathsView *vC = &fast_paths[C];
+                                    GrB_Index lC, hC;
+                                    if (!paths_view_find_row_range(vC, k, &lC, &hC)) {
+                                        continue;
+                                    }
+
+                                    size_t a_idx = 0;
+                                    GrB_Index q = lC;
+                                    const GrB_Index *Aj_C = vC->Aj;
+
+                                    while (a_idx < m && q < hC) {
+                                        if (target_cols_buffer[a_idx] < Aj_C[q]) {
+                                            a_idx = cfl_gallop_search(target_cols_buffer,
+                                                                      a_idx, m, Aj_C[q]);
+                                        } else if (Aj_C[q] < target_cols_buffer[a_idx]) {
+                                            q = cfl_gallop_search(
+                                                Aj_C, q, hC, target_cols_buffer[a_idx]);
+                                        } else {
+                                            info = cfl_frontier_claim_pair(
+                                                fast_paths, C, k,
+                                                target_cols_buffer[a_idx], q, &next);
+                                            if (info != GrB_SUCCESS) {
+                                                goto cleanup;
+                                            }
+                                            hitB = true;
+                                            a_idx++;
+                                            q++;
+                                        }
+                                    }
+                                }
+
+                                if (hitB) {
+                                    info = cfl_frontier_claim_pair(fast_paths, B, i, k,
+                                                                   pB, &next);
+                                    if (info != GrB_SUCCESS) {
+                                        goto cleanup;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    r = r_b_end;
+                }
+
+                idx = end;
+            }
+            qa->n = 0;
         }
 
-        // Advance to the next BFS level by swapping queues
-        q_curr.n = 0;
-        CFL_StateQueue tmp_q = q_curr;
-        q_curr = q_next;
-        q_next = tmp_q;
+        cur.active_count = 0;
+        CFL_Frontier t = cur;
+        cur = next;
+        next = t;
     }
 
     // Assemble final output matrices
@@ -1060,12 +1133,12 @@ cleanup:
     free_row_presence(&rp);
     free_binary_index(&bin_idx);
     free_term_index(&term_idx);
-    free(q_curr.v);
-    free(q_next.v);
-    free(q_tmp.v);
-    free(js_buf);
-    free(rows);
-    free(cols);
+    cfl_frontier_free(&cur, symbols_amount);
+    cfl_frontier_free(&next, symbols_amount);
+    free(tmp_sort_queue.v);
+    free(target_cols_buffer);
+    free(pair_rows);
+    free(pair_cols);
     free(pair_vals);
 
     return info;
