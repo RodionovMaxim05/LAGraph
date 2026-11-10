@@ -1196,6 +1196,22 @@ GrB_Info LAGraph_CFL_Edges_adv(GrB_Matrix *edges, GrB_Matrix *reachability,
         GRB_TRY(GrB_Matrix_nrows(&n, R[start_nonterm]));
     }
 
+    if (pairs != NULL) {
+        GrB_Matrix intersection = NULL;
+        GRB_TRY(GrB_Matrix_new(&intersection, GrB_BOOL, n, n));
+
+        GRB_TRY(GrB_Matrix_eWiseMult_BinaryOp(intersection, NULL, NULL, GrB_LAND,
+                                              R[start_nonterm], pairs, NULL));
+
+        GrB_Index nz_common = 0;
+        GRB_TRY(GrB_Matrix_nvals(&nz_common, intersection));
+        GrB_free(&intersection);
+
+        if (nz_common == 0) {
+            goto cleanup;
+        }
+    }
+
     GRB_TRY(GrB_Scalar_new(&thunk_zero, GrB_INT64));
     GRB_TRY(GrB_Scalar_setElement_INT64(thunk_zero, 0));
 
