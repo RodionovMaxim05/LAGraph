@@ -35,12 +35,6 @@
 
 #define LG_FREE_WORK                                                                     \
     do {                                                                                 \
-        if (R != NULL) {                                                                 \
-            for (size_t i_ = 0; i_ < symbols_amount; i_++) {                             \
-                GrB_free(&R[i_]);                                                        \
-            }                                                                            \
-        }                                                                                \
-        LAGraph_Free((void **)&R, NULL);                                                 \
         LAGraph_Free((void **)&new_rules, NULL);                                         \
         free(triples);                                                                   \
         triples = NULL;                                                                  \
@@ -94,7 +88,8 @@ static inline int32_t pat_role_id(const LAGraph_Pat_role *role, int64_t mask,
         int32_t a_ = (pa), b_ = (pb), c_ = (pc);                                         \
         if (a_ >= 0 && b_ >= 0 && c_ >= 0 && (size_t)a_ < symbols_amount &&              \
             (size_t)b_ < symbols_amount && (size_t)c_ < symbols_amount &&                \
-            R[a_] != NULL && R[b_] != NULL && R[c_] != NULL) {                           \
+            reach_matrices[a_] != NULL && reach_matrices[b_] != NULL &&                  \
+            reach_matrices[c_] != NULL) {                                                \
             if (triples_count == triples_cap) {                                          \
                 size_t ncap = triples_cap ? 2 * triples_cap : 64;                        \
                 if (ncap < triples_cap || ncap > SIZE_MAX / sizeof(CFL_triple)) {        \
@@ -1145,25 +1140,25 @@ cleanup:
 }
 
 // Main entry point for advanced Context-Free Language edge extraction.
-GrB_Info LAGraph_CFL_Edges_adv(GrB_Matrix *edges, GrB_Matrix *reachability,
-                               const GrB_Matrix *adj_matrices, size_t symbols_amount,
-                               const LAGraph_rule_EWCNF *rules, size_t rules_count,
-                               size_t start_nonterm, const GrB_Matrix pairs, char *msg,
-                               int8_t optimizations) {
+GrB_Info LAGraph_CFL_extract_edges(GrB_Matrix *edges, const GrB_Matrix *reach_matrices,
+                                   const GrB_Matrix *adj_matrices, size_t symbols_amount,
+                                   const LAGraph_rule_EWCNF *rules, size_t rules_count,
+                                   size_t start_nonterm, const GrB_Matrix pairs,
+                                   char *msg) {
     LG_CLEAR_MSG;
     GrB_Info info = GrB_SUCCESS;
 
-    GrB_Matrix *R = NULL;
     LAGraph_rule_EWCNF *new_rules = NULL;
     size_t new_rules_count = 0;
     CFL_triple *triples = NULL;
     size_t triples_count = 0, triples_cap = 0;
     CFL_TermRule *terminal_rules = NULL;
     size_t terminal_count = 0;
-    GrB_Scalar thunk_zero = NULL;
     GrB_Index n = 0;
 
     LG_ASSERT_MSG(edges != NULL, GrB_NULL_POINTER, "The edges array cannot be null.");
+    LG_ASSERT_MSG(reach_matrices != NULL, GrB_NULL_POINTER,
+                  "The reachability matrices array cannot be null.");
     LG_ASSERT_MSG(adj_matrices != NULL, GrB_NULL_POINTER,
                   "The adjacency matrices array cannot be null.");
     LG_ASSERT_MSG(rules != NULL || rules_count == 0, GrB_NULL_POINTER,
@@ -1174,15 +1169,8 @@ GrB_Info LAGraph_CFL_Edges_adv(GrB_Matrix *edges, GrB_Matrix *reachability,
     for (size_t i = 0; i < symbols_amount; i++) {
         edges[i] = NULL;
     }
-    if (reachability != NULL) {
-        *reachability = NULL;
-    }
 
-    LG_TRY(LAGraph_Calloc((void **)&R, symbols_amount, sizeof(GrB_Matrix), msg));
-    LG_TRY(LAGraph_CFL_reachability_adv(R, adj_matrices, symbols_amount, rules,
-                                        rules_count, msg, optimizations));
-
-    if (R[start_nonterm] == NULL) {
+    if (reach_matrices[start_nonterm] == NULL) {
         goto cleanup;
     }
 
@@ -1193,7 +1181,7 @@ GrB_Info LAGraph_CFL_Edges_adv(GrB_Matrix *edges, GrB_Matrix *reachability,
         }
     }
     if (n == 0) {
-        GRB_TRY(GrB_Matrix_nrows(&n, R[start_nonterm]));
+        GRB_TRY(GrB_Matrix_nrows(&n, reach_matrices[start_nonterm]));
     }
 
     if (pairs != NULL) {
@@ -1201,7 +1189,8 @@ GrB_Info LAGraph_CFL_Edges_adv(GrB_Matrix *edges, GrB_Matrix *reachability,
         GRB_TRY(GrB_Matrix_new(&intersection, GrB_BOOL, n, n));
 
         GRB_TRY(GrB_Matrix_eWiseMult_BinaryOp(intersection, NULL, NULL, GrB_LAND,
-                                              R[start_nonterm], pairs, NULL));
+                                              reach_matrices[start_nonterm], pairs,
+                                              NULL));
 
         GrB_Index nz_common = 0;
         GRB_TRY(GrB_Matrix_nvals(&nz_common, intersection));
@@ -1211,9 +1200,6 @@ GrB_Info LAGraph_CFL_Edges_adv(GrB_Matrix *edges, GrB_Matrix *reachability,
             goto cleanup;
         }
     }
-
-    GRB_TRY(GrB_Scalar_new(&thunk_zero, GrB_INT64));
-    GRB_TRY(GrB_Scalar_setElement_INT64(thunk_zero, 0));
 
     for (size_t i = 0; i < rules_count; i++) {
         new_rules_count += (rules[i].indexed_count == 0) ? 1 : rules[i].indexed_count;
@@ -1368,28 +1354,12 @@ GrB_Info LAGraph_CFL_Edges_adv(GrB_Matrix *edges, GrB_Matrix *reachability,
         }
     }
 
-    if (reachability != NULL) {
-        if (pairs == NULL) {
-            GRB_TRY(GrB_Matrix_new(reachability, GrB_BOOL, n, n));
-            GRB_TRY(GrB_select(*reachability, NULL, NULL, GrB_OFFDIAG, R[start_nonterm],
-                               thunk_zero, NULL));
-        } else {
-            GRB_TRY(GrB_Matrix_new(reachability, GrB_BOOL, n, n));
-            GRB_TRY(GrB_Matrix_eWiseMult_BinaryOp(*reachability, NULL, NULL, GrB_LAND,
-                                                  R[start_nonterm], pairs, NULL));
-        }
-    }
-
-    GRB_TRY(extract_edges_worklist(edges, R, adj_matrices, symbols_amount, n,
+    GRB_TRY(extract_edges_worklist(edges, reach_matrices, adj_matrices, symbols_amount, n,
                                    start_nonterm, triples, triples_count, terminal_rules,
                                    terminal_count, pairs));
 
 cleanup:
-    GrB_free(&thunk_zero);
     free(terminal_rules);
     LG_FREE_WORK;
-    if (info != GrB_SUCCESS && reachability != NULL) {
-        GrB_free(reachability);
-    }
     return info;
 }

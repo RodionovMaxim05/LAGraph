@@ -1812,11 +1812,11 @@ GrB_Info LAGraph_CFL_AllPaths_adv_free_outputs(
   GrB_Type* all_paths_ptr_t
 );
 
-GrB_Info LAGraph_CFL_Edges_adv(GrB_Matrix *edges, GrB_Matrix *reachability,
-                               const GrB_Matrix *adj_matrices, size_t symbols_amount,
-                               const LAGraph_rule_EWCNF *rules, size_t rules_count,
-                               size_t start_nonterm, const GrB_Matrix pairs, char *msg,
-                               int8_t optimizations);
+GrB_Info LAGraph_CFL_extract_edges(GrB_Matrix *edges, const GrB_Matrix *reach_matrices,
+                                   const GrB_Matrix *adj_matrices, size_t symbols_amount,
+                                   const LAGraph_rule_EWCNF *rules, size_t rules_count,
+                                   size_t start_nonterm, const GrB_Matrix pairs,
+                                   char *msg);
 
 
 //------------------------------------------------------------------------------
