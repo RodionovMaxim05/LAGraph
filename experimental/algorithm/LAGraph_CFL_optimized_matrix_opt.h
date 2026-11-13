@@ -93,6 +93,9 @@ GrB_Info CFL_mxm(CFL_Matrix *output, CFL_Matrix *first, CFL_Matrix *second, bool
 GrB_Info CFL_wise(CFL_Matrix *output, CFL_Matrix *first, CFL_Matrix *second, bool accum,
                   int8_t optimizations);
 
+GrB_Info matrix_wise_block(CFL_Matrix *output, CFL_Matrix *first, CFL_Matrix *second, bool accum,
+                           int8_t optimizations);
+
 // Computes C = B \ A, i.e. C(i, j) = true iff B(i, j) = true and A(i, j) = false.
 GrB_Info CFL_rsub(CFL_Matrix *output, CFL_Matrix *mask, int8_t optimizations);
 GrB_Info CFL_dup(CFL_Matrix *output, CFL_Matrix *input, int8_t optimizations);
