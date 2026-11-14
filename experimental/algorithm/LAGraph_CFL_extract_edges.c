@@ -952,6 +952,21 @@ static GrB_Info extract_edges_worklist(GrB_Matrix *edges, const GrB_Matrix *R,
             int32_t A = cur.active[a];
             CFL_PairQueue *qa = &cur.q[A];
 
+            // A terminal claimed by a binary rule (X -> B t or X -> t C): it has no rules of
+            // its own, so its claimed pairs are edges of the graph and are emitted here.
+            if (term_idx.offset[A] == term_idx.offset[A + 1] &&
+                bin_idx.offset[A] == bin_idx.offset[A + 1] && adj_views[A].open) {
+                for (size_t idx = 0; idx < qa->n; idx++) {
+                    info =
+                        cfl_edge_append(&eb[A], qa->v[idx].src_node, qa->v[idx].dst_node);
+                    if (info != GrB_SUCCESS) {
+                        goto cleanup;
+                    }
+                }
+                qa->n = 0;
+                continue;
+            }
+
             info = cfl_sort_pair_queue(qa, &tmp_sort_queue);
             if (info != GrB_SUCCESS) {
                 goto cleanup;
